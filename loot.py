@@ -127,7 +127,6 @@ def reverse_rng_calls(table, results):
 
 def process_loot_pool(pool, rng):
     rolls = pool['rolls']
-    print(rng.seed)
     if type(rolls) is int:
         pass
     elif type(rolls) is dict:
@@ -141,7 +140,6 @@ def process_loot_pool(pool, rng):
     else:
         raise ValueError
     entries = pool['entries']
-    print('  ',rolls)
     for _ in range(rolls):
         if len(entries) == 1:
             entry = entries[0]
@@ -149,7 +147,6 @@ def process_loot_pool(pool, rng):
             tot_weight = 0
             for entry in entries: tot_weight += entry.get('weight', 1)
             pick = rng.next_int(tot_weight)
-            print('    ',pick)
             tot_weight = 0
             for entry in entries:
                 tot_weight += entry.get('weight', 1)
@@ -187,7 +184,6 @@ def process_loot_pool(pool, rng):
                 raise ValueError
         else:
             qty = 1
-        print('    ',qty)
         if entry['type'] == 'minecraft:empty':
             yield (None, 0)
         else:

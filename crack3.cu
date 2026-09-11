@@ -59,6 +59,7 @@ __constant__ uint8_t d_distinct_items;
 __constant__ uint8_t d_popcnt;
 __constant__ uint32_t d_shuffle_order;
 __constant__ int32_t d_feature_seed_info[4];
+__device__ uint64_t  d_spawn_ok_count;
 __device__ uint32_t  d_match_count;
 __device__ uint32_t  d_correct_count;
 __constant__ int64_t  d_spawn_checks[MAX_SPAWN_CHECKS*4];
@@ -132,6 +133,7 @@ __global__ void check_loot_collision(uint32_t test_kernel) {
     for (int i=threadIdx.x; i<d_num_spawn_checks; i+=blockDim.x) s_spawn_checks[i] = d_spawn_checks[4*i+3];
     __syncthreads();
     int8_t loot[MAX_DISTINCT_ITEMS];
+    uint64_t spawn_ok_count = 0;
 
     const int32_t x = d_feature_seed_info[0], z = d_feature_seed_info[1], index = d_feature_seed_info[2], step = d_feature_seed_info[3];
     const uint64_t bt_reverse_float_accel = d_buried_treasure_float;
@@ -168,6 +170,7 @@ __global__ void check_loot_collision(uint32_t test_kernel) {
                 spawn_ok &= spawn_check(wseed, s_spawn_checks[j]);
             }
             if (!spawn_ok) continue;
+            spawn_ok_count++;
             
             for (int calls=0; calls<4; calls++) { // DES TEMPLE TODO parameterize (use x/z to get call#)
                 int64_t feat_seed = get_lcg_feature_seed(wseed, x, z, index, step, calls) & LCG_MSK;
@@ -227,6 +230,7 @@ __global__ void check_loot_collision(uint32_t test_kernel) {
             }
         }
     }
+    atomicAdd((unsigned long long*)&d_spawn_ok_count, (unsigned long long)spawn_ok_count);
 }
 
 void gpu_init() {
@@ -242,32 +246,35 @@ void gpu_init() {
     cudaMemcpyToSymbol(d_buried_treasure_float, &h_buried_treasure_float, sizeof(uint64_t));
     cudaMemset(&d_match_count, 0, sizeof(uint32_t));
     cudaMemset(&d_correct_count, 0, sizeof(uint32_t));
+    cudaMemset(&d_spawn_ok_count, 0, sizeof(uint64_t));
 
     printf("Launching test kernel...\n");
 
     uint64_t timer;
-    uint32_t test_kernel_size = 2048;
+    uint32_t test_kernel_size = 16384;
     do {
         test_kernel_size /= 2;
         timer = -time_us();
         check_loot_collision<<<1024, 256>>>(test_kernel_size);
         cudaDeviceSynchronize();
         timer += time_us();
-    } while (timer < 1000000);
+    } while (timer < 200000);
     printf("Test kernel finished in %.1fms\n",(float)timer / 1000);
     printf("Estimated time to check all seeds: %.1fs\n\n", (float)timer / 1000000 * test_kernel_size);
     printf("Launching full kernel...\n");
 
-//    check_loot_collision<<<1024, 256>>>(0);
-//    cudaDeviceSynchronize();
+    check_loot_collision<<<1024, 256>>>(0);
+    cudaDeviceSynchronize();
 
 
 
     uint32_t h_match_count;
     uint32_t h_correct_count;
+    uint64_t h_spawn_ok_count;
     cudaMemcpyFromSymbol(&h_match_count, d_match_count, sizeof(uint32_t));
     cudaMemcpyFromSymbol(&h_correct_count, d_correct_count, sizeof(uint32_t));
-    printf("Checked %lu seeds.\nFound %u matches using items.\nFiltered to %u matches using the shuffle of empty slots.\n", 0, h_match_count, h_correct_count);
+    cudaMemcpyFromSymbol(&h_spawn_ok_count, d_spawn_ok_count, sizeof(uint64_t));
+    printf("%lu seeds passed structure spawn check.\nFound %u matches using items.\nFiltered to %u matches using the shuffle of empty slots.\n", h_spawn_ok_count, h_match_count, h_correct_count);
 }
 
 int main() {

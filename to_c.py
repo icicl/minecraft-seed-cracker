@@ -37,7 +37,11 @@ else:
     table = possible_tables[0]
 
 from loot import loottable_c
+from entropy_calc import entropy
 
+h1, h2 = entropy(table, loot_item_counts, contents)
+print(f"Loot items give {h1:.1f} bits of information, and the positions of occupied chest slots gives {h2:.1f}.")
+print(f"Total: {h1+h2:.1f} bits of ~48 needed for unique determination.\n")
 step,index = salts[table]
 shuffle_order = 0
 for i in range(27): shuffle_order |= ((contents[i][0] is not None) << i)
