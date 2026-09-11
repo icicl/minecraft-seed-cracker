@@ -16,11 +16,13 @@ def process_image(path):
         result = ""
         consec_spaces = -1
         while True:
+#            print(result,x0)
             consec_spaces += 1
             match = None
             for char in alphabet:
                 glyph = chars[char]
                 dx = x0 - glyph.shape[1]
+                if dx < 0: continue
                 dy = y0
                 masked = np.where(glyph, img_arr[dy:dy+glyph.shape[0],dx:dx+glyph.shape[1]].sum(axis=-1), 0).astype(int)
                 if np.where(masked, abs(masked - (255 + 3*text_color)) <= 3*color_tolerance, 0).sum() == glyph.sum():
@@ -40,7 +42,7 @@ def process_image(path):
     def get_match(slot):
         slot_arr = np.array(slot)
         idx = 0
-        best_score = 0.5
+        best_score = 0.25
         best = None
         for x in range(0,16*16*scale, 16*scale):
             for y in range(0, 16*16*scale, 16*scale):
@@ -136,4 +138,4 @@ def process_image(path):
             possible_tables.append(tname)
     print(f"The detected loot can generate in the following structures: {possible_tables}.")
 
-    return ((ssx,ssy,ssz) if coords else None), contents, possible_tables
+    return ((ssx,ssy,ssz) if coords else None), contents, distinct_content_items, possible_tables

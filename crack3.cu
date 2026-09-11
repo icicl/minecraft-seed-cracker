@@ -2,6 +2,15 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
 
+#include <sys/time.h>
+
+uint64_t time_us() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t micros = (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+    return micros;
+}
+
 enum structures {
     DESERT_TEMPLE,
     BURIED_TREASURE
@@ -66,15 +75,14 @@ int64_t* h_spawn_checks;
 uint8_t h_num_spawn_checks;
 uint64_t h_buried_treasure_float;
 
-__device__ int64_t get_wseed_from_btfloat(int64_t rng_out, int64_t packed_info) {
-    int64_t prev = (rng_out * 0xdfe05bcb1365 + 0x615c0e462aa9) & LCG_MSK;
+__device__ int64_t reverse_prng_call(int64_t rng_out, int64_t packed_info) {
+    int64_t prev = (rng_out * 0xdfe05bcb1365 + 0x615c0e462aa9);
     prev ^= LCG_MUL;
     prev -= packed_info;
     return prev & LCG_MSK;
 }
 
 __device__ uint8_t can_spawn_desert_pyramid(int64_t seed_with_salt, int32_t mcx, int32_t mcz) {
-//    printf("%ld %d %d\n", seed_with_salt, mcx, mcz);
     int64_t seed = (seed_with_salt ^ LCG_MUL) & LCG_MSK;
     return next_int(seed, 32 - 8) == mcx && next_int(seed, 32 - 8) == mcz;
 }
@@ -112,9 +120,21 @@ __device__ int64_t get_lcg_feature_seed(int64_t world_seed, int32_t x, int32_t z
 }
 
 
-__global__ void check_loot_collision() {
+__global__ void check_loot_collision(uint32_t test_kernel) {
     int tx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
+
+    __shared__ uint32_t s_table[MAX_LOOT_TABLE_SIZE/4];
+    __shared__ uint8_t s_target[MAX_DISTINCT_ITEMS];
+    __shared__ int64_t s_spawn_checks[MAX_SPAWN_CHECKS];
+    for (int i=threadIdx.x; i<MAX_LOOT_TABLE_SIZE/4; i+=blockDim.x) s_table[i] = ((uint32_t*)d_table)[i];
+    for (int i=threadIdx.x; i<d_distinct_items; i+=blockDim.x) s_target[i] = d_target[i];
+    for (int i=threadIdx.x; i<d_num_spawn_checks; i+=blockDim.x) s_spawn_checks[i] = d_spawn_checks[4*i+3];
+    __syncthreads();
+    int8_t loot[MAX_DISTINCT_ITEMS];
+
+    const int32_t x = d_feature_seed_info[0], z = d_feature_seed_info[1], index = d_feature_seed_info[2], step = d_feature_seed_info[3];
+    const uint64_t bt_reverse_float_accel = d_buried_treasure_float;
 /*
     int64_t aa = 7577095897946LL;
     for (int64_t u = 17+24*tx; u < (1LL << 31); u += 24*stride) {
@@ -129,85 +149,80 @@ __global__ void check_loot_collision() {
     }
     return;
 */
-
-    __shared__ uint32_t s_table[MAX_LOOT_TABLE_SIZE/4];
-    __shared__ uint8_t s_target[MAX_DISTINCT_ITEMS];
-    __shared__ int64_t s_spawn_checks[MAX_SPAWN_CHECKS];
-    for (int i=threadIdx.x; i<MAX_LOOT_TABLE_SIZE/4; i+=blockDim.x) s_table[i] = ((uint32_t*)d_table)[i];
-    for (int i=threadIdx.x; i<d_distinct_items; i+=blockDim.x) s_target[i] = d_target[i];
-    for (int i=threadIdx.x; i<d_num_spawn_checks; i+=blockDim.x) s_spawn_checks[i] = d_spawn_checks[4*i+3];
-    __syncthreads();
-    int8_t loot[MAX_DISTINCT_ITEMS];
-
-    const int32_t x = d_feature_seed_info[0], z = d_feature_seed_info[1], index = d_feature_seed_info[2], step = d_feature_seed_info[3];
-    const uint64_t bt_reverse_float_accel = d_buried_treasure_float;
-
     int64_t seed, wseed;
-    uint64_t dseed = tx;
-    const uint64_t dseed_limit = bt_reverse_float_accel == 0 ? ((uint64_t)1 << 48) : FLOAT_0_01_LIM;
-    while (dseed < dseed_limit ) {
-        wseed = seed = (bt_reverse_float_accel == 0 ? dseed : get_wseed_from_btfloat(dseed, bt_reverse_float_accel));
-        dseed += stride;
-        uint8_t spawn_ok = 1;
-        for (int j=0; j<d_num_spawn_checks && spawn_ok; j++) {
-            spawn_ok &= spawn_check(seed, s_spawn_checks[j]);
-        }
-        if (!spawn_ok) continue;
-        
-        for (int calls=0; calls<4; calls++) { // DES TEMPLE TODO parameterize (use x/z to get call#)
-            seed = wseed;
-            int64_t feat_seed = get_lcg_feature_seed(seed, x, z, index, step, calls) & LCG_MSK;
-            seed = feat_seed ^ LCG_MUL;
 
-            for (int i=1;i<d_distinct_items; i++) loot[i] = s_target[i];
-            loot[0] = INT8_MAX; // don't want to break if 'empty' (id=0) rolled
-            uint32_t* table_idx = s_table; // aligned to 4-bytes:    [num_pools | pad | pad | pad] { [rmin | rmax | totweight(2-byte) ] { [item_id | qmin | qmax | ench] } }
-            int num_pools = table_idx[0] & 0xFF;
-            table_idx += 1;
-            int match = 1;
-            int pool_idx = num_pools;
-            while ((pool_idx--) && match) {
-                uint32_t pool_stats = table_idx[0];
-                int rmin = pool_stats & 0xFF, rmax = (pool_stats >> 8) & 0xFF;
-                int tot_weight = pool_stats >> 16;
-                int num_rolls = next_int_util(seed, rmin, rmax);
-                for (int roll_num=0; roll_num<num_rolls; roll_num++) {
-                    int ent_idx = next_int_util(seed, 1, tot_weight);
-                    uint32_t entry_stats = table_idx[ent_idx]; // table is a LUT - each possible chosen cum. weight has an entry for the corresponding item. This info is calculated in the invoking python
-                    int qmin = (entry_stats >> 8) & 0xFF, qmax = (entry_stats >> 16) & 0xFF, ench = (entry_stats >> 24);
-                    if (ench) {
-                        int ench_idx = next_int(seed, 37);
-                        if ((ENCH_PACKED >> ench_idx) & 1) next_int(seed, 1); // ignore result (already have enough info w/o it)
+    // Buried treasure
+    const int64_t inner_lb = tx, inner_ub = FLOAT_0_01_LIM, inner_stride = (test_kernel ? test_kernel : 1)*stride;
+    const int64_t outer_lb = 0, outer_ub = 1, outer_stride = 1;
+
+    // Desert pyramid
+//    int64_t inner_lb = 0, inner_ub = (1LL<<17), inner_stride = 1;
+//    int64_t outer_lb = (17LL + 24*tx)<<17, outer_ub = (1LL << 48), outer_stride = (24LL*stride)<<17;
+// 7577095897946LL
+
+    for (int64_t oi = outer_lb; oi < outer_ub; oi += outer_stride) {
+        for (int64_t ii = inner_lb; ii < inner_ub; ii += inner_stride) {
+            wseed = reverse_prng_call(oi + ii, bt_reverse_float_accel);
+            uint8_t spawn_ok = 1;
+            for (int j=0; j<d_num_spawn_checks && spawn_ok; j++) {
+                spawn_ok &= spawn_check(wseed, s_spawn_checks[j]);
+            }
+            if (!spawn_ok) continue;
+            
+            for (int calls=0; calls<4; calls++) { // DES TEMPLE TODO parameterize (use x/z to get call#)
+                int64_t feat_seed = get_lcg_feature_seed(wseed, x, z, index, step, calls) & LCG_MSK;
+                seed = feat_seed ^ LCG_MUL;
+
+                for (int i=1;i<d_distinct_items; i++) loot[i] = s_target[i];
+                loot[0] = INT8_MAX; // don't want to break if 'empty' (id=0) rolled
+                uint32_t* table_idx = s_table; // aligned to 4-bytes:    [num_pools | pad | pad | pad] { [rmin | rmax | totweight(2-byte) ] { [item_id | qmin | qmax | ench] } }
+                int num_pools = table_idx[0] & 0xFF;
+                table_idx += 1;
+                int match = 1;
+                int pool_idx = num_pools;
+                while ((pool_idx--) && match) {
+                    uint32_t pool_stats = table_idx[0];
+                    int rmin = pool_stats & 0xFF, rmax = (pool_stats >> 8) & 0xFF;
+                    int tot_weight = pool_stats >> 16;
+                    int num_rolls = next_int_util(seed, rmin, rmax);
+                    for (int roll_num=0; roll_num<num_rolls; roll_num++) {
+                        int ent_idx = next_int_util(seed, 1, tot_weight);
+                        uint32_t entry_stats = table_idx[ent_idx]; // table is a LUT - each possible chosen cum. weight has an entry for the corresponding item. This info is calculated in the invoking python
+                        int qmin = (entry_stats >> 8) & 0xFF, qmax = (entry_stats >> 16) & 0xFF, ench = (entry_stats >> 24);
+                        if (ench) { // TODO -- acount for tool/armor filtering
+                            int ench_idx = next_int(seed, 37);
+                            if ((ENCH_PACKED >> ench_idx) & 1) next_int(seed, 1); // ignore result (already have enough info w/o it)
+                        }
+                        int qty = next_int_util(seed, qmin, qmax);
+                        if ((loot[entry_stats & 0xFF] -= qty) < 0) {
+                            match = 0;
+                            break;
+                        };
                     }
-                    int qty = next_int_util(seed, qmin, qmax);
-                    if ((loot[entry_stats & 0xFF] -= qty) < 0) {
-                        match = 0;
-                        break;
-                    };
+                    table_idx += (1 + tot_weight); // jump ahead by 1 entry (num. roll and tot weight info), plus the tot_weight LUT entries
                 }
-                table_idx += (1 + tot_weight); // jump ahead by 1 entry (num. roll and tot weight info), plus the tot_weight LUT entries
-            }
-            for (int i=1; (i<d_distinct_items)&&match; i++) { // start at 1 (ignore minecraft:empty at index 0)
-                if (loot[i] != 0) match = 0;
-            }
+                for (int i=1; (i<d_distinct_items)&&match; i++) { // start at 1 (ignore minecraft:empty at index 0)
+                    if (loot[i] != 0) match = 0;
+                }
 
-            if (match) {
-                atomicAdd(&d_match_count, 1);
-                uint8_t ind[27];
-                for (int i=0; i<27; i++) ind[i] = i;
-                for (int i=27; i>1; i--) {
-                    int j = next_int(seed, i);
-                    uint8_t tmp = ind[j];
-                    ind[j] = ind[i-1];
-                    ind[i-1] = tmp;
-                }
-                int8_t correct = 1;
-                for (int i=27-d_popcnt; i<27; i++) {
-                    if (((d_shuffle_order >> ind[i]) & 1) == 0) correct = 0;
-                }
-                if (correct) {
-                    printf("%ld\n", wseed);
-                    atomicAdd(&d_correct_count, 1);
+                if (match && !test_kernel) {
+                    atomicAdd(&d_match_count, 1);
+                    uint8_t ind[27];
+                    for (int i=0; i<27; i++) ind[i] = i;
+                    for (int i=27; i>1; i--) {
+                        int j = next_int(seed, i);
+                        uint8_t tmp = ind[j];
+                        ind[j] = ind[i-1];
+                        ind[i-1] = tmp;
+                    }
+                    int8_t correct = 1;
+                    for (int i=27-d_popcnt; i<27; i++) {
+                        if (((d_shuffle_order >> ind[i]) & 1) == 0) correct = 0;
+                    }
+                    if (correct) {
+                        printf("%ld\n", wseed);
+                        atomicAdd(&d_correct_count, 1);
+                    }
                 }
             }
         }
@@ -228,28 +243,50 @@ void gpu_init() {
     cudaMemset(&d_match_count, 0, sizeof(uint32_t));
     cudaMemset(&d_correct_count, 0, sizeof(uint32_t));
 
-    printf("Launching kernel...\n");
-    const uint64_t NUM_SEEDS_TO_CHECK = 1L << 42; // todo - base on filter #1
-    check_loot_collision<<<1024, 256>>>();
+    printf("Launching test kernel...\n");
+
+    uint64_t timer;
+    uint32_t test_kernel_size = 2048;
+    do {
+        test_kernel_size /= 2;
+        timer = -time_us();
+        check_loot_collision<<<1024, 256>>>(test_kernel_size);
+        cudaDeviceSynchronize();
+        timer += time_us();
+    } while (timer < 1000000);
+    printf("Test kernel finished in %.1fms\n",(float)timer / 1000);
+    printf("Estimated time to check all seeds: %.1fs\n\n", (float)timer / 1000000 * test_kernel_size);
+    printf("Launching full kernel...\n");
+
+//    check_loot_collision<<<1024, 256>>>(0);
+//    cudaDeviceSynchronize();
 
 
-    cudaDeviceSynchronize();
 
     uint32_t h_match_count;
     uint32_t h_correct_count;
     cudaMemcpyFromSymbol(&h_match_count, d_match_count, sizeof(uint32_t));
     cudaMemcpyFromSymbol(&h_correct_count, d_correct_count, sizeof(uint32_t));
-    printf("Checked %lu seeds.\nFound %u matches using items.\nFiltered to %u matches using the shuffle of empty slots.\n", NUM_SEEDS_TO_CHECK, h_match_count, h_correct_count);
+    printf("Checked %lu seeds.\nFound %u matches using items.\nFiltered to %u matches using the shuffle of empty slots.\n", 0, h_match_count, h_correct_count);
 }
 
 int main() {
-uint32_t shuffle_order = 0b011100111011101100001001101;
-uint8_t table[1140] = {2, 0, 0, 0, 2, 4, 232, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 4, 4, 50, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0};
-uint8_t target[8] = {0, 0, 4, 3, 5, 1, 1, 6};
-int distinct_items = 8;
+//uint32_t shuffle_order = 0b011100111011101100001001101;
+//uint8_t table[1140] = {2, 0, 0, 0, 2, 4, 232, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 4, 4, 50, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0};
+//uint8_t target[8] = {0, 0, 4, 3, 5, 1, 1, 6};
+//int distinct_items = 8;
+//uint32_t shuffle_order = 0b111111111111111111111111111;
+//uint8_t table[244] = {5, 0, 0, 0, 1, 1, 1, 0, 2, 1, 1, 0, 5, 8, 35, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 3, 1, 4, 0, 4, 1, 4, 0, 4, 1, 4, 0, 4, 1, 4, 0, 4, 1, 4, 0, 4, 1, 4, 0, 4, 1, 4, 0, 4, 1, 4, 0, 4, 1, 4, 0, 4, 1, 4, 0, 4, 1, 4, 0, 5, 1, 2, 0, 5, 1, 2, 0, 5, 1, 2, 0, 5, 1, 2, 0, 5, 1, 2, 0, 1, 3, 15, 0, 1, 4, 8, 0, 1, 4, 8, 0, 1, 4, 8, 0, 1, 4, 8, 0, 1, 4, 8, 0, 6, 1, 2, 0, 6, 1, 2, 0, 6, 1, 2, 0, 6, 1, 2, 0, 6, 1, 2, 0, 7, 1, 5, 0, 7, 1, 5, 0, 7, 1, 5, 0, 7, 1, 5, 0, 7, 1, 5, 0, 0, 1, 2, 0, 1, 1, 1, 0, 8, 1, 1, 0, 2, 2, 2, 0, 9, 2, 4, 0, 1, 2, 4, 0};
+//uint8_t target[10] = {0, 0, 1, 14, 4, 2, 3, 2, 1, 7};
+//int distinct_items = 10;
+uint32_t shuffle_order = 0b111011100010010000110111110;
+uint8_t table[1140] = {2, 0, 0, 0, 2, 4, 232, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 2, 7, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 3, 3, 7, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 4, 4, 50, 0, 2, 1, 8, 0, 2, 1, 8, 0, 2, 1, 8, 0, 2, 1, 8, 0, 2, 1, 8, 0, 2, 1, 8, 0, 2, 1, 8, 0, 2, 1, 8, 0, 2, 1, 8, 0, 2, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 3, 1, 8, 0, 3, 1, 8, 0, 3, 1, 8, 0, 3, 1, 8, 0, 3, 1, 8, 0, 3, 1, 8, 0, 3, 1, 8, 0, 3, 1, 8, 0, 3, 1, 8, 0, 3, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0};
+uint8_t target[5] = {0, 0, 13, 8, 4};
+int distinct_items = 5;
+int32_t feature_seed_info[4] = {7450, 10972, 3, 4}; // x, z, index, step
+
 int64_t spawns_checks[12] = {7984, 10480, DESERT_TEMPLE, 0, 7450, 10968, DESERT_TEMPLE};
-int num_spawn_checks = 1;
-int32_t feature_seed_info[4] = {7984, 10480, 3, 4}; // x, z, index, step
+int num_spawn_checks = 2;
 uint64_t buried_treasure_float = 1153169326606791148LL; // 75998109126254LL
     int popcnt = 0;
     for (int i=0; i<27; i++) popcnt += ((shuffle_order >> i)&1);
