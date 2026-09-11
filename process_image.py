@@ -33,7 +33,7 @@ def get_chars_packed():
         glyph = ascii_arr[y:y+8,x:x+8]
         n = 0
         for i,v in enumerate((glyph[:,:,-1] == 255).astype(np.uint64).flatten()):
-            n |= (v << i)
+            n |= (int(v) << i)
         for width in range(1,9):
             mask = int("01"*8,16) * ((1<<width) - 1)
             if n & mask == n: break

@@ -71,7 +71,7 @@ def load_all_tables():
     if os.path.exists(all_table_fp):
         with open(all_table_fp) as f: tables = eval(f.read())
     else:
-        print("Cache for processed loot tables not found on disk. Regenerating...", end='\r')
+        print("Cache for processed loot tables not found on disk. Regenerating...", end='\n')
         tables = {}
         with zipfile.ZipFile(zf, 'r') as z:
             for zi in z.filelist:
@@ -101,7 +101,7 @@ def load_atlas(scale, itemlist):
     else:
         t0 = time.time()
         t1 = t0
-        print(f"Atlas for GUI scale {scale} not found on disk. Regenerating, please wait ~1-2min...", end='\r')
+        print(f"Atlas for GUI scale {scale} not found on disk. Regenerating, please wait ~1-2min...", end='\n')
         atlas = Image.new("RGBA", (16*(16*scale), 16*(16*scale)), (0,0,0,0))
         for y in range(16):
             for x in range(16):

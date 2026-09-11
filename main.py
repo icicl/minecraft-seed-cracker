@@ -50,15 +50,18 @@ def get_info(ss_dir, ss_count=10):
     candidates = []
 
     col_widths = [4,30,50,18,18,30]
-    print_table_row(None,col_widths)
-    print_table_row(['Id#','Filename','Possible Structures','Block Coordinates','Chunk Coordinates','Entropy (F,R)'],col_widths)
-    print_table_row(None,col_widths)
+    first_entry = True # so that if cache needs to regenerate, prints after debug for that
     for file in sorted(glob.glob(ss_dir + '*.png'))[-ss_count:]:
         processed = process_image(file, prompt_uncertain=False)
         if processed is None: continue
         coords, contents, possible_tables = processed
         possible_tables = [table for table in possible_tables if sum(entropy(table)) < float('inf')]
         candidates.append((file[len(ss_dir):],coords,possible_tables))
+        if first_entry:
+            print_table_row(None,col_widths)
+            print_table_row(['Id#','Filename','Possible Structures','Block Coordinates','Chunk Coordinates','Entropy (F,R)'],col_widths)
+            print_table_row(None,col_widths)
+            first_entry = False
         print_table_row([
             len(candidates),
             file[len(ss_dir):],
