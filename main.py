@@ -161,6 +161,9 @@ def process_info_for_cuda(spawn_checks_in, loot_container, loot_spawn):
     ench_callcounts = get_enchant_rng_call_data_c()
     print(f"\nCracking structure {table} loot chest with these contents:")
     print_container(loot_container)
+    for x,z,table in spawn_checks_in:
+        print(f"Filtering seeds using structure spawn of type {table} as coordinates {x},{z}")
+    print()
 
     return (shuffle_order,
             np.array(loottable, dtype=np.uint8),
@@ -205,14 +208,14 @@ def run(ss_dir, ss_count):
         with open(f'run_history/{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.txt', 'w') as f:
             for scx,scz,sctable in spawn_checks:
                 f.write(f'{scx}\t{scz}\t{sctable}\n')
+            f.write(f'\n{x}\t{z}\t{table}\n')
             for row in range(3):
-                f.write('\n')
                 for item,qty in contents[row*9:row*9+9]:
                     if item is None:
                         f.write('-\n')
                     else:
                         f.write(f'{item.replace("minecraft:","")}\t{qty}\n')
-            f.write(f'{x}\t{z}\t{table}\n')
+                f.write('\n')
     else:
         spawn_checks = []
         contents = []
@@ -230,14 +233,14 @@ def run(ss_dir, ss_count):
                 x,z,table = int(line[0]), int(line[1]), line[2].lower()
             else:
                 print(f"Skipping line '{line_}' - does not match format 'x z structure'.")
-            for row in range(3):
-                for col in range(9):
-                    line_ = f.readline().strip()
-                    line = line_.split()
-                    if len(line) == 2 and re.fullmatch(r'\d+', line[1]):
-                        contents.append(['minecraft:' + line[0].lower(), int(line[1])]) # TODO check item valid
-                    else:
-                        contents.append([None, 0])
+            while len(contents) < 27:
+                line_ = f.readline().strip()
+                if line_ == "": continue
+                line = line_.split()
+                if len(line) == 2 and re.fullmatch(r'\d+', line[1]):
+                    contents.append(['minecraft:' + line[0].lower(), int(line[1])]) # TODO check item valid
+                else:
+                    contents.append([None, 0])
                 
 
 
