@@ -107,8 +107,6 @@ __device__ uint8_t spawn_check(int64_t wseed, int64_t packed_info) {
 }
 
 __device__ int64_t get_lcg_feature_seed(int64_t world_seed, int32_t x, int32_t z, int index, int step, int calls) {
-    x = x & 0xFFFFFFF0;
-    z = z & 0xFFFFFFF0;
     int64_t seed = (world_seed ^ LCG_MUL) & LCG_MSK;
 
     int64_t a = next_long(seed) | 1, b = next_long(seed) | 1;
@@ -135,7 +133,7 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
     int8_t loot[MAX_DISTINCT_ITEMS];
     uint64_t spawn_ok_count = 0;
 
-    const int32_t x = d_feature_seed_info[0], z = d_feature_seed_info[1], index = d_feature_seed_info[2], step = d_feature_seed_info[3];
+    const int32_t x = d_feature_seed_info[0] & 0xFFFFFFF0, z = d_feature_seed_info[1] & 0xFFFFFFF0, index = d_feature_seed_info[2], step = d_feature_seed_info[3];
     const uint64_t prng_first_call_salt = d_prng_first_call_salt;
 
     __shared__ uint16_t stacks_data[27*256];

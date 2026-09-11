@@ -30,13 +30,13 @@ def get_info(ss_dir, ss_count=10):
 
     col_widths = [4,30,50,18,18,30]
     print_table_row(None,col_widths)
-    print_table_row(['Id#','Filename','Possible Structures','Block Coordinates','Chunk Coordinates','Entropy (I,S,F,R)'],col_widths)
+    print_table_row(['Id#','Filename','Possible Structures','Block Coordinates','Chunk Coordinates','Entropy (F,R)'],col_widths)
     print_table_row(None,col_widths)
     for file in sorted(glob.glob(ss_dir + '*.png'))[-ss_count:]:
         processed = process_image(file, prompt_uncertain=False)
         if processed is None: continue
         coords, contents, loot_item_counts, possible_tables, cropped = processed
-        possible_tables = [table for table in possible_tables if sum(entropy(table,loot_item_counts,contents)) < float('inf')]
+        possible_tables = [table for table in possible_tables if sum(entropy(table)) < float('inf')]
         candidates.append((file[len(ss_dir):],coords,possible_tables,loot_item_counts,contents))
         print_table_row([
             len(candidates),
@@ -44,7 +44,7 @@ def get_info(ss_dir, ss_count=10):
             ', '.join(possible_tables),
             'Unknown' if coords is None else f'{coords[0]},{coords[2]}',
             'Unknown' if coords is None else f'{coords[0]//16},{coords[2]//16}',
-            ', '.join(f'{h:4.1f}' for h in entropy(possible_tables[0],loot_item_counts,contents)) if len(possible_tables) == 1 else '????'
+            ', '.join(f'{h:4.1f}' for h in entropy(possible_tables[0])) if len(possible_tables) == 1 else '????'
             ],col_widths)
     print_table_row(None,col_widths)
 
@@ -65,9 +65,6 @@ def get_info(ss_dir, ss_count=10):
                 ids = list(map(int,inp.split(',')))
                 if min(ids) >= 1 and max(ids) <= len(candidates):
                     break
-        seen_cc = set()
-        best_h4 = 0
-        total_h3 = 0
         candidate_used_for_loot_cracking = None
         for idx in ids:
             file,coords,possible_tables,loot,contents = candidates[idx-1]
@@ -83,46 +80,56 @@ def get_info(ss_dir, ss_count=10):
                 print(f"Skipping ID# {idx} - Must have coordinates to use in filtering.")
                 continue
             x,z = coords[0],coords[2]
-            if (x//16,z//16) in seen_cc:
-                print(f"Skipping ID# {idx} - Belongs to a structure already used for filtering.")
-                continue
-            _,_,h3,h4 = entropy(table, loot, contents)
-            if h4 > best_h4:
-                best_h4 = h4
-                _,_,feat_seed_salt,grid_spacing,enum_idx,_ = salts[table]
-                feat_seed_base = (((x // grid_spacing)*341873128712+(z // grid_spacing)*132897987541 + feat_seed_salt) & 0xFFFF_FFFF_FFFF) | (enum_idx << 56)
-                spawn_check_type = salts[table][5][0]
-                if spawn_check_type == 0:
-                    spacing = salts[table][5][1]
-                    feat_seed_base |= ((x // 16) % spacing) << 48
-                skip_prng_reverse_feature = len(spawn_checks) if abs(h4 - h3) < 0.0001 else None
-            spawn_check_type = salts[table][5][0]
-            cx,cz = x//16,z//16
-            if spawn_check_type == 0: # grid based w/ 2 randint calls
-                spacing = salts[table][5][1]
-                mcx,mcz = cx%spacing,cz%spacing
-                rx,rz = cx//spacing,cz//spacing
-                structure_salt = (rx*341873128712 + rz*132897987541 + salts[table][2]) & 0xFFFF_FFFF_FFFF
-                structure_id = salts[table][4]
-                spawn_checks.append(structure_salt | (mcz << 48) | (mcx << (48 + 6)) | (structure_id << (48 + 2*6)))
-            elif spawn_check_type == 1: # every chunk, based on nextfloat call
-                structure_salt = (cx*341873128712 + cz*132897987541 + salts[table][2]) & 0xFFFF_FFFF_FFFF
-                structure_id = salts[table][4]
-                spawn_checks.append(structure_salt | (structure_id << (48 + 2*6)))
-            else:
-                print(f"WARNING: unimplemented structure spawn check type {spawn_check_type}. Skipping...")
-            seen_cc.add((x//16,z//16))
-            total_h3 += h3
-        if skip_prng_reverse_feature is not None: del spawn_checks[skip_prng_reverse_feature]
+            spawn_checks.append([x, z, table])
         if len(spawn_checks) == 0: print('At least one valid structure required for filter stage.')
-    return candidate_used_for_loot_cracking, spawn_checks, feat_seed_base, (total_h3-best_h4, best_h4)
+    return candidate_used_for_loot_cracking, spawn_checks
 
+
+def process_info_for_cuda(spawn_checks_in, loot_container):
+    seen_cc = set()
+    best_h4 = 0
+    total_h3 = 0
+    spawn_checks = []
+    for x,z,table in spawn_checks_in:
+        cx,cz = x//16,z//16
+        if (cx,cz) in seen_cc:
+            print(f"Skipping {table} as {cx},{cz} - Belongs to a structure already used for filtering.")
+            continue
+        h3,h4 = entropy(table)
+        if h4 > best_h4:
+            best_h4 = h4
+            _,_,feat_seed_salt,grid_spacing,enum_idx,_ = salts[table]
+            feat_seed_base = (((x // grid_spacing)*341873128712+(z // grid_spacing)*132897987541 + feat_seed_salt) & 0xFFFF_FFFF_FFFF) | (enum_idx << 56)
+            spawn_check_type = salts[table][5][0]
+            if spawn_check_type == 0:
+                spacing = salts[table][5][1]
+                feat_seed_base |= ((x // 16) % spacing) << 48
+            skip_prng_reverse_feature = len(spawn_checks) if abs(h4 - h3) < 0.0001 else None
+        spawn_check_type = salts[table][5][0]
+        cx,cz = x//16,z//16
+        if spawn_check_type == 0: # grid based w/ 2 randint calls
+            spacing = salts[table][5][1]
+            mcx,mcz = cx%spacing,cz%spacing
+            rx,rz = cx//spacing,cz//spacing
+            structure_salt = (rx*341873128712 + rz*132897987541 + salts[table][2]) & 0xFFFF_FFFF_FFFF
+            structure_id = salts[table][4]
+            spawn_checks.append(structure_salt | (mcz << 48) | (mcx << (48 + 6)) | (structure_id << (48 + 2*6)))
+        elif spawn_check_type == 1: # every chunk, based on nextfloat call
+            structure_salt = (cx*341873128712 + cz*132897987541 + salts[table][2]) & 0xFFFF_FFFF_FFFF
+            structure_id = salts[table][4]
+            spawn_checks.append(structure_salt | (structure_id << (48 + 2*6)))
+        else:
+            print(f"WARNING: unimplemented structure spawn check type {spawn_check_type}. Skipping...")
+        seen_cc.add((x//16,z//16))
+    if skip_prng_reverse_feature is not None: del spawn_checks[skip_prng_reverse_feature]
+    return spawn_checks, feat_seed_base
 
 def run(ss_dir, ss_count):
     if not ss_dir.endswith('/'): ss_dir += '/'
-    file, spawn_checks, feat_seed_base, (h3, h4) = get_info(ss_dir, ss_count)
+    file, spawn_checks = get_info(ss_dir, ss_count)
     coords, contents, loot, possible_tables, cropped = process_image(ss_dir + file, prompt_uncertain=True)
-    possible_tables = [table for table in possible_tables if sum(entropy(table,loot,contents)) < float('inf')]
+    possible_tables = [table for table in possible_tables if sum(entropy(table)) < float('inf')]
+    spawn_checks, feat_seed_base = process_info_for_cuda(spawn_checks, None)
 
     if coords is None:
         while True:
@@ -145,7 +152,6 @@ def run(ss_dir, ss_count):
     else:
         table = possible_tables[0]
 
-    h1, h2, _, _ = entropy(table, loot, contents)
     step,index,feat_seed_salt,_,enum_idx,_ = salts[table]
     shuffle_order = 0
     for i in range(27): shuffle_order |= ((contents[i][0] is not None) << i)

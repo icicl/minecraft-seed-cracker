@@ -39,18 +39,15 @@ def get_chars_packed():
             if n & mask == n: break
         chars[chr(charpoint)] = (n,width,mask)
     return chars
-#chars_packed = get_chars_packed()
+chars_packed = get_chars_packed()
 
 
-def ocr(im, stride=None, xslice=slice(None), yslice=slice(None)):
-    if type(im) is str: im = Image.open(path)
-    im = im.convert("RGB")
+def ocr(im_arr, stride=None, xslice=slice(None), yslice=slice(None)):
 
     texts = []
-    px0 = np.array(im)
+    px0 = im_arr
     px0 = np.where((px0.max(axis=-1)==px0.min(axis=-1)), px0[:,:,0], 0)
     px0 = np.where((px0 >= 56), 1, 0).astype(np.uint8)
-    Image.fromarray(px0*255).save('tmp.png')
     for stride in (range(4,0,-1) if stride is None else (stride,)):
         px = px0[::stride,::stride]
         px = px[yslice,xslice]
@@ -93,11 +90,11 @@ def ocr(im, stride=None, xslice=slice(None), yslice=slice(None)):
     return max(texts,key=len)
 
 
-def get_coords(im, scale=None):
-    text = ocr(im, stride=scale, xslice=slice(-300,None), yslice=slice(80,100))
+def get_coords(im_arr, scale=None):
+    text = ocr(im_arr, stride=scale, xslice=slice(-300,None), yslice=slice(80,100))
     coords = re.findall(r'\-?\d+, \-?\d+, \-?\d+', text)
     if coords: return list(map(int,coords[0].split(', ')))
-    text = ocr(im, 2)
+    text = ocr(im_arr, 2)
     print(text)
     coords = re.findall(r'\-?\d+, \-?\d+, \-?\d+', text)
     if coords: return list(map(int,coords[0].split(', ')))
@@ -106,6 +103,7 @@ def get_coords(im, scale=None):
 
 def process_image(path, prompt_uncertain=True, verbose=False):
     def ocr_qty(img_arr, x0, y0, alphabet, text_color, color_tolerance=1, max_consec_spaces=0):
+        img_arr = img_arr[:,:,:3]
         result = ""
         consec_spaces = -1
         while True:
@@ -221,8 +219,8 @@ def process_image(path, prompt_uncertain=True, verbose=False):
 
 
 
-
-#    coords = get_coords(im, scale)
+#    coords = get_coords(im_arr, scale)
+#                ^^ more general - can ocr any text anywhere, but ~2x as slow
 #    if coords:
 #        ssx,ssy,ssz = coords
     coords = ocr_qty(im_arr, w-3*scale, 92*scale, '-0123456789,', 62, 13, 1)

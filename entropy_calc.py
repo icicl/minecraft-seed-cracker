@@ -48,7 +48,7 @@ def likelihood(table, items): # calculate the probability of drawing items (dict
     return prob(tuple(qtys), -1, 0)
 
 
-def entropy(table, items, chest):
+def entropy(table):#, items, chest):
 #    p1 = likelihood(load_all_tables()[table], items) # item quantities
 #    p2 = 1 / comb(27, sum(e[0] is None for e in chest)) # empty/occupied positions
     p3 = 1 / {'desert_pyramid':576, 'buried_treasure':100, 'ruined_portal':625}.get(table, 1) # structure spawn chance
@@ -61,5 +61,5 @@ def entropy(table, items, chest):
 #    h2 = h(p2)
     h3 = h(p3)
     h4 = h(p4)
-    return 0,0,h3,h4
+    return h3,h4
     return h1,h2,h3,h4
