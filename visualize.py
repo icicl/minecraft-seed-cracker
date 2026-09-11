@@ -96,16 +96,17 @@ def visualize(loot, scale=4, w=9, h=3):
                 il[x,y] = (111,111,111)
     for y in range(h):
         for x in range(w):
-            if loot[w*y+x]:
-                item,qty = loot[w*y+x]
-                tex = get_texture(item)
-                try:
-                    im.paste(tex, (x*(sz+1)+1, y*(sz+1)+1), tex)
-                except:
-                    print(f"Failed to render texture for {item} in cell [{x},{y}].")
-                for idx,qty_digit in enumerate(str(qty)[::-1]):
-                    qty_tex = digit_to_image(qty_digit)
-                    qty_tex_w = digit_to_image(qty_digit, (255,255,255))
-                    im.paste(qty_tex, (x*(sz+1)+12-4*idx, y*(sz+1)+10), qty_tex)
+            if loot[w*y+x] is None: continue
+            item,qty = loot[w*y+x]
+            if item is None: continue
+            tex = get_texture(item)
+            try:
+                im.paste(tex, (x*(sz+1)+1, y*(sz+1)+1), tex)
+            except:
+                print(f"Failed to render texture for {item} in cell [{x},{y}].")
+            for idx,qty_digit in enumerate(str(qty)[::-1]):
+                qty_tex = digit_to_image(qty_digit)
+                qty_tex_w = digit_to_image(qty_digit, (255,255,255))
+                im.paste(qty_tex, (x*(sz+1)+12-4*idx, y*(sz+1)+10), qty_tex)
 
     return im.resize((scale*im.size[0], scale*im.size[1]), 0)

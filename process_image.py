@@ -16,7 +16,6 @@ def process_image(path):
         result = ""
         consec_spaces = -1
         while True:
-#            print(result,x0)
             consec_spaces += 1
             match = None
             for char in alphabet:
@@ -41,6 +40,9 @@ def process_image(path):
 
     def get_match(slot):
         slot_arr = np.array(slot)
+        is_empty = abs(slot_arr - slot_arr[0,0]).sum() == 0
+        if is_empty:
+            return 1,None,0
         idx = 0
         best_score = 0.25
         best = None
@@ -119,7 +121,17 @@ def process_image(path):
             py = y1 + (1 + 2 +14 + 1)*scale + (1 + 16 + 1)*scale*cy
             slot = im.crop((px, py, px+16*scale, py+16*scale))
             conf,item,qty = get_match(slot)
-            if item is None: contents.append((None,0))
+            if item is None:
+                if conf != 1:
+                    while True:
+                        inp = input(f"Failed to detect item in row {cy}, column {cx}. Enter the item and quantity (ex. 'leather_chestplate,1'): ").replace(' ','')
+                        if inp.count(',') == 1:
+                            item,qty = inp.split(',')
+                            if qty.isdecimal() and (item in all_items or 'minecraft:'+item in all_items): break
+                    if item not in all_items: item = 'minecraft:' + item
+                    contents.append((item,int(qty)))
+                else:
+                    contents.append((None,0))
             else: contents.append((item, qty))
     
     distinct_content_items = {}
@@ -128,14 +140,6 @@ def process_image(path):
         distinct_content_items[item] = qty + distinct_content_items.get(item, 0)
     print(distinct_content_items)
 
-    possible_tables = []
-    for tname,table in tables.items():
-        t_items = set()
-        for _,entries in table:
-            for entry in entries:
-                if entry[0][0]: t_items.add(entry[0][0])
-        if all(item in t_items for item in distinct_content_items):
-            possible_tables.append(tname)
-    print(f"The detected loot can generate in the following structures: {possible_tables}.")
 
-    return ((ssx,ssy,ssz) if coords else None), contents, distinct_content_items, possible_tables
+    im_cropped_to_container = im.crop((x1, y1, x1+scale*((1 + 2 + 4 + 1)*2 + (1 + 16 + 1)*9), y1+scale*((1 + 2 + 14 + 1)*2 + (1 + 16 + 1)*3)))
+    return ((ssx,ssy,ssz) if coords else None), contents, distinct_content_items, im_cropped_to_container
