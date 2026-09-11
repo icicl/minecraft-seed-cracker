@@ -31,20 +31,27 @@ __device__ int32_t next_int_util(int64_t* seed, int32_t min, int32_t max) {
 uint8_t* h_table;
 uint8_t* h_target;
 uint8_t  h_distinct_items;
+uint8_t  h_popcnt;
+uint32_t h_shuffle_order;
 
-#define MAX_DISTINCT_ITEMS 64
+#define MAX_DISTINCT_ITEMS 20
 #define MAX_LOOT_TABLE_SIZE 256
 
 __constant__ uint8_t d_table[MAX_LOOT_TABLE_SIZE]; // Adjust size to match your maximum table byte-size
 __constant__ uint8_t d_target[MAX_DISTINCT_ITEMS];
 __constant__ uint8_t d_distinct_items;
+__constant__ uint8_t d_popcnt;
+__constant__ uint32_t d_shuffle_order;
+
+
 
 __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
+    uint64_t c0=0,c1=0,c2=0,c3=0;
     int tx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
     for (uint64_t dseed=tx; dseed<num_seeds; dseed+=stride) {
         int64_t seed = seed_start+dseed;
-        int loot[256] = {0}; // todo - size smartly. needs only distinct_items length
+        uint8_t loot[MAX_DISTINCT_ITEMS] = {0}; // todo - size smartly. needs only distinct_items length
         uint8_t* table_idx = d_table;
         int num_pools = table_idx[0];
         table_idx += 1;
@@ -58,7 +65,9 @@ __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
             for (int roll_num=0; roll_num<num_rolls; roll_num++) {
                 int cur_weight = 0, ent_idx=-1;
                 int targ_weight = next_int_util(&seed, 1, tot_weight);
-                do {cur_weight += table_idx[5*(++ent_idx) + 1];} while (cur_weight < targ_weight);
+                do {
+                    cur_weight += table_idx[5*(++ent_idx) + 1];
+                } while (cur_weight < targ_weight);
                 int qmin = table_idx[5*ent_idx + 2], qmax = table_idx[5*ent_idx + 3], ench = table_idx[5*ent_idx + 4];
                 if (ench) {
                     uint64_t ENCH_PACKED = 0b11001111100111101111111101110111111L; // which enchantments need a second call
@@ -74,7 +83,32 @@ __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
         for (int i=1; i<d_distinct_items; i++) { // start at 1 (ignore empty)
             if (loot[i] != d_target[i]) match = 0;
         }
-        if (match) printf("%ld\n", seed_start+dseed);
+        if (match) {
+            uint8_t ind[27];
+            for (int i=0; i<27; i++) {
+                ind[i] = i;
+            }
+            for (int i=27; i>1; i--) {
+                int j = next_int(&seed, i);
+                uint8_t tmp = ind[j];
+                ind[j] = ind[i-1];
+                ind[i-1] = tmp;
+            }
+            int8_t correct = 1;
+            for (int i=27-d_popcnt; i<27; i++) {
+                if (((d_shuffle_order >> ind[i]) & 1) == 0) {
+                    correct = 0;
+                    break;
+                }
+            }
+            if (correct) {
+                printf("%ld\n", seed_start+dseed);
+            }
+        }
+    }
+    if (tx == -1) {
+        int shift = 10;
+        printf("CLOCKS: %lu %lu %lu %lu\n", c0>>shift, c1>>shift, c2>>shift, c3>>shift);
     }
 }
 
@@ -97,21 +131,26 @@ void gpu_init(int64_t seed) {
     cudaMemcpyToSymbol(d_table, h_table, MAX_LOOT_TABLE_SIZE*sizeof(uint8_t));
     cudaMemcpyToSymbol(d_target, h_target, MAX_DISTINCT_ITEMS*sizeof(uint8_t));
     cudaMemcpyToSymbol(d_distinct_items, &h_distinct_items, sizeof(uint8_t));
+    cudaMemcpyToSymbol(d_popcnt, &h_popcnt, sizeof(uint8_t));
+    cudaMemcpyToSymbol(d_shuffle_order, &h_shuffle_order, sizeof(uint32_t));
 
 
     printf("Launching kernel...\n");
-    check_loot_collision<<<256, 256>>>(
-        seed, 1<<30
+    check_loot_collision<<<1024, 256>>>(
+        seed, 1L<<32
     );
 
     cudaDeviceSynchronize();
 }
 
 int main() {
-    int64_t seed = 6721027238469L;
-    uint8_t table[107] = {2, 2, 4, 15, 1, 5, 1, 3, 0, 2, 15, 1, 5, 0, 3, 15, 2, 7, 0, 4, 15, 1, 3, 0, 5, 25, 4, 6, 0, 6, 25, 1, 3, 0, 7, 25, 3, 7, 0, 8, 20, 1, 1, 0, 9, 15, 1, 1, 0, 10, 10, 1, 1, 0, 11, 5, 1, 1, 0, 12, 20, 1, 1, 1, 13, 20, 1, 1, 0, 14, 2, 1, 1, 0, 0, 15, 1, 1, 0, 4, 4, 5, 5, 10, 1, 8, 0, 15, 10, 1, 8, 0, 7, 10, 1, 8, 0, 16, 10, 1, 8, 0, 17, 10, 1, 8, 0};
-    uint8_t target[18] = {0, 0, 0, 0, 0, 17, 0, 0, 1, 0, 0, 0, 2, 0, 0, 2, 0, 3};
-    int distinct_items = 18;
+    uint32_t shuffle_order = 0b000011101011111111111111000;
+int64_t seed = 6721027238469;
+uint8_t table[107] = {2, 2, 4, 15, 1, 5, 1, 3, 0, 2, 15, 1, 5, 0, 3, 15, 2, 7, 0, 4, 15, 1, 3, 0, 5, 25, 4, 6, 0, 6, 25, 1, 3, 0, 7, 25, 3, 7, 0, 8, 20, 1, 1, 0, 9, 15, 1, 1, 0, 10, 10, 1, 1, 0, 11, 5, 1, 1, 0, 12, 20, 1, 1, 1, 13, 20, 1, 1, 0, 14, 2, 1, 1, 0, 0, 15, 1, 1, 0, 4, 4, 5, 5, 10, 1, 8, 0, 15, 10, 1, 8, 0, 7, 10, 1, 8, 0, 16, 10, 1, 8, 0, 17, 10, 1, 8, 0};
+uint8_t target[18] = {0, 0, 0, 0, 0, 17, 0, 0, 1, 0, 0, 0, 2, 0, 0, 2, 0, 3};
+int distinct_items = 18;
+    int popcnt = 0;
+    for (int i=0; i<27; i++) popcnt += ((shuffle_order >> i)&1);
     if (distinct_items > MAX_DISTINCT_ITEMS) {
         printf("ERROR - too many items in loot table. Recompile with larger MAX_DISTINCT_ITEMS.\n");
         exit(1);
@@ -120,10 +159,11 @@ int main() {
     h_table = table;
     h_target = target;
     h_distinct_items = distinct_items;
+    h_popcnt = popcnt;
+    h_shuffle_order = shuffle_order;
 
     print_table(table);
-    gpu_init(seed-555);
-//    check_loot_collision(seed, 1<<20);
+    gpu_init(seed & 0xFFFFFFFF00000000L);
 
     return 0;
 }
