@@ -13,7 +13,8 @@ uint64_t time_us() {
 
 enum structures {
     DESERT_TEMPLE,
-    BURIED_TREASURE
+    BURIED_TREASURE,
+    RUINED_PORTAL,
 };
 
 #define FLOAT_0_01_LIM (((uint64_t)(0.01f * (1 << 24)) + 1) << 24)
@@ -59,10 +60,11 @@ __constant__ uint8_t d_distinct_items;
 __constant__ uint8_t d_popcnt;
 __constant__ uint32_t d_shuffle_order;
 __constant__ int32_t d_feature_seed_info[4];
-__device__ unsigned long long  d_match_counts[4];
+__device__ unsigned long long  d_match_counts[5];
 __constant__ int64_t  d_spawn_checks[MAX_SPAWN_CHECKS];
 __constant__ uint8_t d_num_spawn_checks;
 __constant__ int64_t d_prng_first_call_salt;
+__constant__ uint16_t d_split_stacks[27];
 
 uint8_t* h_table;
 uint8_t* h_target;
@@ -73,7 +75,8 @@ int32_t* h_feature_seed_info;
 int64_t* h_spawn_checks;
 uint8_t h_num_spawn_checks;
 uint64_t h_prng_first_call_salt;
-uint64_t h_match_counts[4];
+uint64_t h_match_counts[5];
+uint16_t* h_split_stacks;
 
 __device__ int64_t reverse_prng_call(int64_t rng_out, int64_t packed_info) {
     int64_t prev = (rng_out * 0xdfe05bcb1365 + 0x615c0e462aa9);
@@ -82,12 +85,12 @@ __device__ int64_t reverse_prng_call(int64_t rng_out, int64_t packed_info) {
     return prev & LCG_MSK;
 }
 
-__device__ uint8_t can_spawn_desert_pyramid(int64_t seed_with_salt, int32_t mcx, int32_t mcz) {
+__device__ uint8_t can_spawn_grid_based(int64_t seed_with_salt, int32_t mcx, int32_t mcz, uint8_t modulus) {
     int64_t seed = (seed_with_salt ^ LCG_MUL) & LCG_MSK;
-    return next_int(seed, 32 - 8) == mcx && next_int(seed, 32 - 8) == mcz;
+    return next_int(seed, modulus) == mcx && next_int(seed, modulus) == mcz;
 }
 
-__device__ uint8_t can_spawn_buried_treasure(int64_t seed_with_salt) {
+__device__ uint8_t can_spawn_prob_based(int64_t seed_with_salt) {
     int64_t seed = (seed_with_salt ^ LCG_MUL) & LCG_MSK;
     return next(seed, 24) < 167773; // 0.01*(2^24) = 167772.2
 }
@@ -96,10 +99,13 @@ __device__ uint8_t spawn_check(int64_t wseed, int64_t packed_info) {
     uint8_t structure_type = packed_info >> (48 + 2*6), mx = (packed_info >> (48 + 6)) & (0b111111), mz = (packed_info >> 48) & 0b111111;
     switch (structure_type) {
         case DESERT_TEMPLE:
-            return can_spawn_desert_pyramid(wseed + packed_info, mx, mz);
+            return can_spawn_grid_based(wseed + packed_info, mx, mz, 24);
             break;
         case BURIED_TREASURE:
-            return can_spawn_buried_treasure(wseed + packed_info);
+            return can_spawn_prob_based(wseed + packed_info);
+            break;
+        case RUINED_PORTAL:
+            return can_spawn_grid_based(wseed + packed_info, mx, mz, 25);
             break;
     }
     return 0;
@@ -137,7 +143,10 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
     const int32_t x = d_feature_seed_info[0], z = d_feature_seed_info[1], index = d_feature_seed_info[2], step = d_feature_seed_info[3];
     const uint64_t prng_first_call_salt = d_prng_first_call_salt;
 
-    
+    __shared__ uint16_t stacks_data[27*256];
+    uint16_t* stacks = stacks_data + 27*(threadIdx.x);
+    uint8_t stacks_idx;
+
     int64_t seed, wseed;
 
     // Buried treasure
@@ -153,6 +162,10 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
             inner_lb = tx + dispatch_idx*stride, inner_ub = FLOAT_0_01_LIM, inner_stride = num_dispatches*stride;
             outer_lb = 0, outer_ub = 1, outer_stride = 1;
             break;
+        case RUINED_PORTAL:
+            inner_lb = dispatch_idx, inner_ub = (1LL<<17), inner_stride = num_dispatches;
+            outer_lb = (17LL + 25*tx)<<17, outer_ub = (1LL << 48), outer_stride = (25LL*stride)<<17;
+            break;
     }
 
     atomicAdd(d_match_counts+0, ((outer_ub - outer_lb - 1) / outer_stride + 1) * ((inner_ub - inner_lb - 1) / inner_stride + 1));
@@ -167,58 +180,97 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
             spawn_ok_count++;
             
             for (int calls=0; calls<4; calls++) { // DES TEMPLE TODO parameterize (use x/z to get call#)
-                int64_t feat_seed = get_lcg_feature_seed(wseed, x, z, index, step, calls) & LCG_MSK;
-                seed = feat_seed ^ LCG_MUL;
-
-                for (int i=1;i<d_distinct_items; i++) loot[i] = s_target[i];
-                loot[0] = INT8_MAX; // don't want to break if 'empty' (id=0) rolled
-                uint32_t* table_idx = s_table; // aligned to 4-bytes:    [num_pools | pad | pad | pad] { [rmin | rmax | totweight(2-byte) ] { [item_id | qmin | qmax | ench] } }
-                int num_pools = table_idx[0] & 0xFF;
-                table_idx += 1;
                 int match = 1;
-                int pool_idx = num_pools;
-                while ((pool_idx--) && match) {
-                    uint32_t pool_stats = table_idx[0];
-                    int rmin = pool_stats & 0xFF, rmax = (pool_stats >> 8) & 0xFF;
-                    int tot_weight = pool_stats >> 16;
-                    int num_rolls = next_int_util(seed, rmin, rmax);
-                    for (int roll_num=0; roll_num<num_rolls; roll_num++) {
-                        int ent_idx = next_int_util(seed, 1, tot_weight);
-                        uint32_t entry_stats = table_idx[ent_idx]; // table is a LUT - each possible chosen cum. weight has an entry for the corresponding item. This info is calculated in the invoking python
-                        int qmin = (entry_stats >> 8) & 0xFF, qmax = (entry_stats >> 16) & 0xFF, ench = (entry_stats >> 24);
-                        if (ench) { // TODO -- acount for tool/armor filtering
-                            int ench_idx = next_int(seed, 37);
-                            if ((ENCH_PACKED >> ench_idx) & 1) next_int(seed, 1); // ignore result (already have enough info w/o it)
-                        }
-                        int qty = next_int_util(seed, qmin, qmax);
-                        if ((loot[entry_stats & 0xFF] -= qty) < 0) {
-                            match = 0;
-                            break;
-                        };
-                    }
-                    table_idx += (1 + tot_weight); // jump ahead by 1 entry (num. roll and tot weight info), plus the tot_weight LUT entries
-                }
-                for (int i=1; (i<d_distinct_items)&&match; i++) { // start at 1 (ignore minecraft:empty at index 0)
-                    if (loot[i] != 0) match = 0;
-                }
+                for (uint8_t save_to_smem=0; save_to_smem<2; save_to_smem++) { // it is faster to re-run the loot calculation for the rare case when we get a hit, rather than saving the stack sizes to shared mem every time
+                    int64_t feat_seed = get_lcg_feature_seed(wseed, x, z, index, step, calls) & LCG_MSK;
+                    seed = feat_seed ^ LCG_MUL;
 
-                if (match) {
-                    atomicAdd(d_match_counts+2, 1);
-                    uint8_t ind[27];
-                    for (int i=0; i<27; i++) ind[i] = i;
-                    for (int i=27; i>1; i--) {
-                        int j = next_int(seed, i);
-                        uint8_t tmp = ind[j];
-                        ind[j] = ind[i-1];
-                        ind[i-1] = tmp;
+                    for (int i=1;i<d_distinct_items; i++) loot[i] = s_target[i];
+                    loot[0] = INT8_MAX; // don't want to break if 'empty' (id=0) rolled
+                    stacks_idx = 0;
+                    uint32_t* table_idx = s_table; // aligned to 4-bytes:    [num_pools | pad | pad | pad] { [rmin | rmax | totweight(2-byte) ] { [item_id | qmin | qmax | ench] } }
+                    int num_pools = table_idx[0] & 0xFF;
+                    table_idx += 1;
+                    int pool_idx = num_pools;
+                    while ((pool_idx--) && match) {
+                        uint32_t pool_stats = table_idx[0];
+                        int rmin = pool_stats & 0xFF, rmax = (pool_stats >> 8) & 0xFF;
+                        int tot_weight = pool_stats >> 16;
+                        int num_rolls = next_int_util(seed, rmin, rmax);
+                        for (int roll_num=0; roll_num<num_rolls; roll_num++) {
+                            int ent_idx = next_int_util(seed, 1, tot_weight);
+                            uint32_t entry_stats = table_idx[ent_idx]; // table is a LUT - each possible chosen cum. weight has an entry for the corresponding item. This info is calculated in the invoking python
+                            int qmin = (entry_stats >> 8) & 0xFF, qmax = (entry_stats >> 16) & 0xFF, ench = (entry_stats >> 24);
+                            if (ench) { // TODO -- acount for tool/armor filtering
+                                int ench_idx = next_int(seed, 37);
+                                if ((ENCH_PACKED >> ench_idx) & 1) next_int(seed, 1); // ignore result (already have enough info w/o it)
+                            }
+                            int qty = next_int_util(seed, qmin, qmax);
+                            if ((loot[entry_stats & 0xFF] -= qty) < 0) {
+                                match = 0;
+                                break;
+                            };
+                            if (save_to_smem) stacks[stacks_idx++] = (entry_stats << 8) | qty;
+                        }
+                        table_idx += (1 + tot_weight); // jump ahead by 1 entry (num. roll and tot weight info), plus the tot_weight LUT entries
                     }
-                    int8_t correct = 1;
-                    for (int i=27-d_popcnt; i<27; i++) {
-                        if (((d_shuffle_order >> ind[i]) & 1) == 0) correct = 0;
+                    for (int i=1; (i<d_distinct_items)&&match; i++) { // start at 1 (ignore minecraft:empty at index 0)
+                        if (loot[i] != 0) match = 0;
                     }
-                    if (correct) {
-                        printf("\rFound match: \e[0;32m%ld\e[0m                                              \n", wseed);
-                        atomicAdd(d_match_counts+3, 1);
+
+                    if (match) {
+                        if (save_to_smem == 0) continue;
+                        atomicAdd(d_match_counts+2, 1);
+                        uint8_t ind[27];
+                        for (int i=0; i<27; i++) ind[i] = i;
+                        for (int i=27; i>1; i--) {
+                            int j = next_int(seed, i);
+                            uint8_t tmp = ind[j];
+                            ind[j] = ind[i-1];
+                            ind[i-1] = tmp;
+                        }
+                        for (int i=27-d_popcnt; i<27; i++) {
+                            if (((d_shuffle_order >> ind[i]) & 1) == 0) match = 0;
+                        }
+                        if (match) {
+                            atomicAdd(d_match_counts+3, 1);
+                            uint8_t st_idx = 0, sp_idx = 0;
+                            uint16_t split[27];
+                            for (uint8_t s_idx=0; s_idx < stacks_idx; s_idx++) { // put splittable (qty > 1) stacks at the left, unsplittable at the right
+                                uint16_t item = stacks[s_idx];
+                                uint8_t qty = item & 0xFF;
+                                if (qty <= 0 || (item >> 8) == 0) continue; // skip if empty
+                                if (qty >= 2) stacks[st_idx++] = item;
+                                else split[sp_idx++] = item;
+                            }
+                            while (st_idx > 0 && (st_idx + sp_idx) < 27) {
+                                uint8_t pop_idx = next_int_util(seed, 0, --st_idx);
+                                uint16_t item = stacks[pop_idx];
+                                for (uint8_t s_idx=pop_idx; s_idx<st_idx; s_idx++) stacks[s_idx] = stacks[s_idx+1];
+                                uint8_t qty = item & 0xFF;
+                                item &= 0xFF00;
+                                uint8_t split_qty = next_int_util(seed, 1, qty/2);
+                                qty -= split_qty;
+                                if (qty > 1 && (next(seed, 1) != 0)) stacks[st_idx++] = item | qty;
+                                else split[sp_idx++] = item | qty;
+                                if (split_qty > 1 && (next(seed,1) != 0)) stacks[st_idx++] = item | split_qty;
+                                else split[sp_idx++] = item | split_qty;
+                            }
+                            for (uint8_t s_idx=0; s_idx < st_idx; s_idx++) split[sp_idx++] = stacks[s_idx];
+                            for (int i=sp_idx; i>1; i--) {
+                                int j = next_int(seed, i);
+                                uint16_t tmp = split[j];
+                                split[j] = split[i-1];
+                                split[i-1] = tmp;
+                            }
+                            for (int i=0; i<sp_idx; i++) {
+                                match &= (split[i] == d_split_stacks[ind[26-i]]);
+                            }
+                            if (match) {
+                                printf("\rFound match: \e[0;32m%ld\e[0m                                              \n", wseed);
+                                atomicAdd(d_match_counts+4, 1);
+                            }
+                        }
                     }
                 }
             }
@@ -238,7 +290,8 @@ void gpu_init() {
     cudaMemcpyToSymbol(d_spawn_checks, h_spawn_checks, sizeof(int64_t)*MAX_SPAWN_CHECKS);
     cudaMemcpyToSymbol(d_feature_seed_info, h_feature_seed_info, 4*sizeof(int32_t));
     cudaMemcpyToSymbol(d_prng_first_call_salt, &h_prng_first_call_salt, sizeof(uint64_t));
-    cudaMemset(&d_match_counts, 0, 4*sizeof(unsigned long long));
+    cudaMemset(&d_match_counts, 0, 5*sizeof(unsigned long long));
+    cudaMemcpyToSymbol(d_split_stacks, h_split_stacks, 27*sizeof(uint16_t));
 
     printf("Launching test kernel...\n");
 
@@ -266,8 +319,8 @@ void gpu_init() {
 
 
 
-    cudaMemcpyFromSymbol(&h_match_counts, d_match_counts, 4*sizeof(unsigned long long*));
-    printf("Checked %lu seeds. \n%lu passed structure spawn check.\nFiltered to %lu matches using item quantities in loot.\nFurther filtered to %lu matches using the shuffle of empty slots.\n", h_match_counts[0], h_match_counts[1], h_match_counts[2], h_match_counts[3]);
+    cudaMemcpyFromSymbol(&h_match_counts, d_match_counts, 5*sizeof(unsigned long long*));
+    printf("Checked %lu seeds. \n%lu passed structure spawn check.\nFiltered to %lu matches using item quantities in loot.\nFurther filtered to %lu matches using the shuffle of empty slots. Reduced to %lu using the exact split+shuffle of items.\n", h_match_counts[0], h_match_counts[1], h_match_counts[2], h_match_counts[3], h_match_counts[4]);
 }
 
 //nvcc -O3 -Xcompiler -fPIC -shared crack3.cu -o crack.so
@@ -280,7 +333,8 @@ void dispatch(
     int32_t* feature_seed_info,
     int64_t prng_first_call_salt,
     int64_t* spawn_checks,
-    int num_spawn_checks
+    int num_spawn_checks,
+    uint16_t* split_stacks
 ) {
     int popcnt = 0;
     for (int i=0; i<27; i++) popcnt += ((shuffle_order >> i)&1);
@@ -299,6 +353,7 @@ void dispatch(
     h_spawn_checks = spawn_checks;
     h_feature_seed_info = feature_seed_info;
     h_prng_first_call_salt = prng_first_call_salt;
+    h_split_stacks = split_stacks;
 
 
     gpu_init();

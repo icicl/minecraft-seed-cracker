@@ -10,10 +10,11 @@ from entropy_calc import entropy
 salts = { # step, index, feat seed, grid-based spacing, enum index, spawn check type
     'desert_pyramid':(3,4,14357617,16*32,0,(0,32)),
     'buried_treasure':(1,3,10387320,16,1,(1,)),
-#    'ruined_portal':(5,4,??,16*40,2,(0,40)),
+    'ruined_portal':(5,4,34222645,16*40,2,(0,40)),
 #    'shipwreck_supply':(6,4),
 #    'igloo_chest':(4,4),
 #    'woodland_mansion':(1,4),
+#    'jungle_temple':(,,14357619,16*32,,(0,32))
 }
 
 def print_table_row(vals,widths):
@@ -25,27 +26,27 @@ def print_table_row(vals,widths):
 def get_info(ss_dir, ss_count=10):
     candidates = []
 
+    col_widths = [4,30,50,18,18,30]
+    print_table_row(None,col_widths)
+    print_table_row(['Id#','Filename','Possible Structures','Block Coordinates','Chunk Coordinates','Entropy (I,S,F,R)'],col_widths)
+    print_table_row(None,col_widths)
     for file in sorted(glob.glob(ss_dir + '*.png'))[-ss_count:]:
         processed = process_image(file, prompt_uncertain=False)
         if processed is None: continue
         coords, contents, loot_item_counts, possible_tables, cropped = processed
         possible_tables = [table for table in possible_tables if sum(entropy(table,loot_item_counts,contents)) < float('inf')]
         candidates.append((file[len(ss_dir):],coords,possible_tables,loot_item_counts,contents))
-
-    print(f"Detected {len(candidates)} screenshots with loot inventories:")
-    col_widths = [4,30,50,18,18,30]
-    print_table_row(None,col_widths)
-    print_table_row(['Id#','Filename','Possible Structures','Block Coordinates','Chunk Coordinates','Entropy (I,S,F,R)'],col_widths)
-    print_table_row(None,col_widths)
-    for idx,(file,coords,possible_tables,loot,contents) in enumerate(candidates,1):
         print_table_row([
-            idx,
-            file,
+            len(candidates),
+            file[len(ss_dir):],
             ', '.join(possible_tables),
             'Unknown' if coords is None else f'{coords[0]},{coords[2]}',
             'Unknown' if coords is None else f'{coords[0]//16},{coords[2]//16}',
-            ', '.join(f'{h:.1f}' for h in entropy(possible_tables[0],loot,contents)) if len(possible_tables) == 1 else '????'
+            ', '.join(f'{h:4.1f}' for h in entropy(possible_tables[0],loot_item_counts,contents)) if len(possible_tables) == 1 else '????'
             ],col_widths)
+    print_table_row(None,col_widths)
+
+    print(f"Detected {len(candidates)} screenshots with loot inventories:")
     print_table_row(None,col_widths)
     print('Enter a comma-separated list of structures to use for filtering step.\n' \
         'The first structure will be used for the loot-based cracking.'
@@ -144,6 +145,7 @@ def run(ss_dir, ss_count):
     loottable,lookup = loottable_c(table, loot)
     targ = [0]*len(lookup)
     for item,qty in loot.items(): targ[lookup[item]] = qty
+    split_stacks = [((lookup[item] << 8) | qty) if item else 0 for item,qty in contents]
     print(loot)
 
     print_c_code = False
@@ -170,6 +172,7 @@ def run(ss_dir, ss_count):
         ctypes.c_int64,
         np.ctypeslib.ndpointer(dtype=np.int64, flags="C_CONTIGUOUS"),
         ctypes.c_int,
+        np.ctypeslib.ndpointer(dtype=np.uint16, flags="C_CONTIGUOUS"),
     ]
 
     def dispatch():
@@ -182,6 +185,7 @@ def run(ss_dir, ss_count):
             feat_seed_base,
             np.array(spawn_checks, dtype=np.int64),
             len(spawn_checks),
+            np.array(split_stacks, dtype=np.uint16)
         )
 
     p = Process(target=dispatch)
