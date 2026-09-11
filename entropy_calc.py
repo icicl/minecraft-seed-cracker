@@ -2,7 +2,7 @@ from functools import cache
 from math import comb, log2
 from extract import load_all_tables
 
-def likelihood(table, items):
+def likelihood(table, items): # calculate the probability of drawing items (dict of name:qty) from table table
     lookup = {}
     inv = [item for item in items]
     for item in items: lookup[item] = len(lookup)
@@ -46,6 +46,7 @@ def likelihood(table, items):
             result += oth_prob * prob(remaining, cur_pool, rem_pool_draws-1)
         return result
     return prob(tuple(qtys), -1, 0)
+
 
 def entropy(table, items, chest):
     p1 = likelihood(load_all_tables()[table], items) # item quantities

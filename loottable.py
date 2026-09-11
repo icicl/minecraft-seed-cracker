@@ -3,6 +3,7 @@ def check_keys(obj, keys, prefix=''):
     assert len(obj) == len(keys), f"Expected {len(keys)} keys, got {len(obj)} for {obj}"
     assert all(prefix+key in obj for key in obj), f"Unexpected keys for object {obj}"
 
+
 def get_range(obj, require_explicit_uniform=True):
     if type(obj) is int:
         return obj, obj

@@ -1,14 +1,8 @@
-import os
+import os, zipfile, re
 from PIL import Image
-from extract import get_chest_loot_table, get_texture, is_item
-import zipfile
-import re
-from extract import load_all_tables, load_atlas
 import numpy as np
-from extract import load_ascii
 
-
-
+from extract import load_all_tables, load_atlas, load_ascii
 
 
 def process_image(path, prompt_uncertain=True, verbose=False):
@@ -106,8 +100,8 @@ def process_image(path, prompt_uncertain=True, verbose=False):
     for c,carr in chars.items():
         chars[c] = carr[:np.argmax((carr.sum(axis=1) != 0) * np.arange(8*scale))+1,:np.argmax((carr.sum(axis=0) != 0) * np.arange(8*scale))+1]
 
-    coords = ocr(np.array(im), w-3*scale, 92*scale, '0123456789,:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', 62, 13, 1)
-    coords = re.findall(r'.*?(\d+), (\d+), (\d+)$', coords)
+    coords = ocr(np.array(im), w-3*scale, 92*scale, '-0123456789,', 62, 13, 1)
+    coords = re.findall(r'.*?(\-?\d+), (\-?\d+), (\-?\d+)$', coords)
     if coords:
         ssx,ssy,ssz = map(int,coords[0])
         if verbose: print(f"Found targeted block coordinates: {ssx}, {ssy}, {ssz}.")

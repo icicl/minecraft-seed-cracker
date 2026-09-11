@@ -4,3 +4,6 @@ __pycache__
 ss
 *.so
 cache
+old
+z_docs.txt
+z_TODO
