@@ -5,3 +5,6 @@ enchant_with_levels
 set_stew_effect
 
 enchant specific enchant
+
+split to two steps - first check all seeds for if spawnable,
+then process spawnable

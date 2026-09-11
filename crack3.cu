@@ -7,6 +7,8 @@ enum structures {
     BURIED_TREASURE
 };
 
+#define FLOAT_0_01_LIM (((uint64_t)(0.01f * (1 << 24)) + 1) << 24)
+
 #define LCG_MUL 0x5DEECE66DL
 #define LCG_ADD 0xB
 #define LCG_MSK 0xFFFFFFFFFFFFL
@@ -52,6 +54,7 @@ __device__ uint32_t  d_match_count;
 __device__ uint32_t  d_correct_count;
 __constant__ int64_t  d_spawn_checks[MAX_SPAWN_CHECKS*4];
 __constant__ uint8_t d_num_spawn_checks;
+__constant__ int64_t d_buried_treasure_float;
 
 uint8_t* h_table;
 uint8_t* h_target;
@@ -61,6 +64,14 @@ uint32_t h_shuffle_order;
 int32_t* h_feature_seed_info;
 int64_t* h_spawn_checks;
 uint8_t h_num_spawn_checks;
+uint64_t h_buried_treasure_float;
+
+__device__ int64_t get_wseed_from_btfloat(int64_t rng_out, int64_t packed_info) {
+    int64_t prev = (rng_out * 0xdfe05bcb1365 + 0x615c0e462aa9) & LCG_MSK;
+    prev ^= LCG_MUL;
+    prev -= packed_info;
+    return prev & LCG_MSK;
+}
 
 __device__ uint8_t can_spawn_desert_pyramid(int64_t seed_with_salt, int32_t mcx, int32_t mcz) {
 //    printf("%ld %d %d\n", seed_with_salt, mcx, mcz);
@@ -73,20 +84,16 @@ __device__ uint8_t can_spawn_buried_treasure(int64_t seed_with_salt) {
     return next(seed, 24) < 167773; // 0.01*(2^24) = 167772.2
 }
 
-__device__ uint8_t spawn_checks(int64_t wseed, int64_t* s_spawn_checks) {
-    for (int i=0; i<4*d_num_spawn_checks; i+=4) {
-        uint64_t  packed_info = s_spawn_checks[i+3];
-        uint8_t structure_type = packed_info >> (48 + 2*6), mx = (packed_info >> (48 + 6)) & (0b111111), mz = (packed_info >> 48) & 0b111111;
-//        if (wseed != 777) return 0;// printf("%ld %ld %ld %ld\n", d_spawn_checks[i+0], d_spawn_checks[i+1], d_spawn_checks[i+2], d_spawn_checks[i+3]);
-        switch (structure_type) {
-            case DESERT_TEMPLE:
-//            if (wseed == 777) printf("%ld %ld %ld %ld\n", d_spawn_checks[i+0], d_spawn_checks[i+1], d_spawn_checks[i+2], d_spawn_checks[i+3]);
-                if (!can_spawn_desert_pyramid(wseed + packed_info, mx, mz)) return 0;
-                break;
-            case BURIED_TREASURE:
-                if (!can_spawn_buried_treasure(wseed + packed_info)) return 0;
-                break;
-        }
+__device__ uint8_t spawn_check(int64_t wseed, int64_t packed_info) {
+    uint8_t structure_type = packed_info >> (48 + 2*6), mx = (packed_info >> (48 + 6)) & (0b111111), mz = (packed_info >> 48) & 0b111111;
+    switch (structure_type) {
+        case DESERT_TEMPLE:
+            if (!can_spawn_desert_pyramid(wseed + packed_info, mx, mz)) return 0;
+            break;
+        case BURIED_TREASURE:
+//            if (wseed == 777) printf("%ld\n",packed_info);
+            if (!can_spawn_buried_treasure(wseed + packed_info)) return 0;
+            break;
     }
     return 1;
 }
@@ -114,8 +121,8 @@ __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
     for (int i=threadIdx.x; i<MAX_LOOT_TABLE_SIZE/4; i+=blockDim.x) s_table[i] = ((uint32_t*)d_table)[i];
     __shared__ uint8_t s_target[distinct_items];
     for (int i=threadIdx.x; i<distinct_items; i+=blockDim.x) s_target[i] = d_target[i];
-    __shared__ int64_t s_spawn_checks[4*MAX_SPAWN_CHECKS];
-    for (int i=threadIdx.x; i<4*MAX_SPAWN_CHECKS; i+=blockDim.x) s_spawn_checks[i] = d_spawn_checks[i];
+    __shared__ int64_t s_spawn_checks[MAX_SPAWN_CHECKS];
+    for (int i=threadIdx.x; i<MAX_SPAWN_CHECKS; i+=blockDim.x) s_spawn_checks[i] = d_spawn_checks[4*i+3];
     __syncthreads();
     int txg = blockIdx.x * blockDim.x + threadIdx.x;
     int tx = threadIdx.x;
@@ -123,21 +130,28 @@ __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
     int8_t loot[distinct_items];
 
     const int32_t x = d_feature_seed_info[0], z = d_feature_seed_info[1], index = d_feature_seed_info[2], step = d_feature_seed_info[3];
-
+    const uint64_t bt_reverse_float_accel = d_buried_treasure_float;
 
     uint64_t dseed = txg;
 
     __shared__ int64_t stack[BLOCKSIZE*STACKDEPTH];
-//    int64_t* fifo_addr = fifo + tx*FIFODEPTH;
-    uint8_t stack_ptr = 0;//, fifo_end = 0, fifo_size = 0;
+    uint8_t stack_ptr = 0;
 
-    
     int64_t seed, wseed;
-    while (dseed < num_seeds || stack_ptr > 0) {
-        for (int i=0; i<576 && dseed < num_seeds; i++) {
-            wseed = seed = seed_start + dseed;
+    uint64_t dseed_limit = bt_reverse_float_accel == 0 ? ((uint64_t)1 << 48) : FLOAT_0_01_LIM;
+    while (dseed < dseed_limit || stack_ptr > 0) {
+        for (int i=0; i<576*576 && dseed < dseed_limit; i++) {
+            
+            wseed = seed = (bt_reverse_float_accel == 0 ? dseed : get_wseed_from_btfloat(dseed, bt_reverse_float_accel));
             dseed += stride;
-            if (spawn_checks(seed, s_spawn_checks)) {
+            uint8_t spawn_ok = 1;
+            for (int j=0; j<d_num_spawn_checks; j++) {
+                if (!spawn_check(seed, s_spawn_checks[j])) {
+                    spawn_ok = 0;
+                    break;
+                }
+            }
+            if (spawn_ok) {
                 stack[STACKDEPTH*tx + stack_ptr] = wseed;
                 stack_ptr++;
                 if (stack_ptr == STACKDEPTH) break;
@@ -220,7 +234,7 @@ void print_table(uint8_t* table) { //TODO - fix for new structure
     printf("\n");
 }
 
-void gpu_init(int64_t seed) {
+void gpu_init() {
     printf("Copying data to GPU...\n");
     cudaMemcpyToSymbol(d_table, h_table, MAX_LOOT_TABLE_SIZE*sizeof(uint8_t));
     cudaMemcpyToSymbol(d_target, h_target, MAX_DISTINCT_ITEMS*sizeof(uint8_t));
@@ -230,12 +244,13 @@ void gpu_init(int64_t seed) {
     cudaMemcpyToSymbol(d_num_spawn_checks, &h_num_spawn_checks, sizeof(uint8_t));
     cudaMemcpyToSymbol(d_spawn_checks, h_spawn_checks, 4*sizeof(int64_t)*MAX_SPAWN_CHECKS);
     cudaMemcpyToSymbol(d_feature_seed_info, h_feature_seed_info, 4*sizeof(int32_t));
+    cudaMemcpyToSymbol(d_buried_treasure_float, &h_buried_treasure_float, sizeof(uint64_t));
     cudaMemset(&d_match_count, 0, sizeof(uint32_t));
     cudaMemset(&d_correct_count, 0, sizeof(uint32_t));
 
     printf("Launching kernel...\n");
-    const uint64_t NUM_SEEDS_TO_CHECK = 1L << 38;
-    #define CASE(n) case n: check_loot_collision<n><<<1024, BLOCKSIZE>>>(seed, NUM_SEEDS_TO_CHECK); break;
+    const uint64_t NUM_SEEDS_TO_CHECK = 1L << 42;
+    #define CASE(n) case n: check_loot_collision<n><<<1024, BLOCKSIZE>>>(0, NUM_SEEDS_TO_CHECK); break;
     switch (h_distinct_items) {
         CASE(2);
         CASE(3);
@@ -271,7 +286,8 @@ uint8_t target[8] = {0, 0, 4, 3, 5, 1, 1, 6};
 int distinct_items = 8;
 int64_t spawns_checks[12] = {7353, 10953, BURIED_TREASURE, 0, 7984, 10480, DESERT_TEMPLE, 0, 7450, 10968, DESERT_TEMPLE};
 int num_spawn_checks = 3;
-int32_t feature_seed_info[4] = {7984, 10480, 3, 4};
+int32_t feature_seed_info[4] = {7984, 10480, 3, 4}; // x, z, index, step
+uint64_t buried_treasure_float = 1153169326606791148LL;
     int popcnt = 0;
     for (int i=0; i<27; i++) popcnt += ((shuffle_order >> i)&1);
     if (distinct_items > MAX_DISTINCT_ITEMS) {
@@ -298,6 +314,9 @@ int32_t feature_seed_info[4] = {7984, 10480, 3, 4};
             printf("WARNING - unknowns structure type for spawn checking given at x=%d, z=%d.\n", x, z);
         }
     }
+    if (buried_treasure_float == 0) {
+        printf("WARNING - you are running the cracker without a buried treasure position. This will increase the runtime by ~100x.\n");
+    }
     // todo: check for loot table too large
     h_table = table;
     h_target = target;
@@ -307,12 +326,10 @@ int32_t feature_seed_info[4] = {7984, 10480, 3, 4};
     h_num_spawn_checks = num_spawn_checks;
     h_spawn_checks = spawns_checks;
     h_feature_seed_info = feature_seed_info;
+    h_buried_treasure_float = buried_treasure_float;
 
-//    printf("%ld %ld %ld %ld\n", h_spawn_checks[0], h_spawn_checks[1], h_spawn_checks[2], h_spawn_checks[3]);
 
-//    print_table(table);
-    int seed = 0;
-    gpu_init(seed & 0xFFFFFFFF00000000L);
+    gpu_init();
 
     return 0;
 }
