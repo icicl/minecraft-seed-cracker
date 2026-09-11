@@ -99,9 +99,13 @@ def visualize(loot, scale=4, w=9, h=3):
             if loot[w*y+x]:
                 item,qty = loot[w*y+x]
                 tex = get_texture(item)
-                im.paste(tex, (x*(sz+1)+1, y*(sz+1)+1), tex)
-                qty_tex = digit_to_image(str(qty))
-                qty_tex_w = digit_to_image(str(qty), (255,255,255))
-                im.paste(qty_tex, (x*(sz+1)+12, y*(sz+1)+10), qty_tex)
+                try:
+                    im.paste(tex, (x*(sz+1)+1, y*(sz+1)+1), tex)
+                except:
+                    print(f"Failed to render texture for {item} in cell [{x},{y}].")
+                for idx,qty_digit in enumerate(str(qty)[::-1]):
+                    qty_tex = digit_to_image(qty_digit)
+                    qty_tex_w = digit_to_image(qty_digit, (255,255,255))
+                    im.paste(qty_tex, (x*(sz+1)+12-4*idx, y*(sz+1)+10), qty_tex)
 
     return im.resize((scale*im.size[0], scale*im.size[1]), 0)

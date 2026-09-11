@@ -6,16 +6,20 @@
 #define LCG_ADD 0xB
 #define LCG_MSK 0xFFFFFFFFFFFFL
 
-__device__ int64_t next(int64_t* seed, int bits) {
-    *seed = (*seed * LCG_MUL + LCG_ADD) & LCG_MSK;
-    return (uint64_t)*seed >> (48 - 31);
+#define MAX_DISTINCT_ITEMS 16
+#define MAX_LOOT_TABLE_SIZE 2048
+#define ENCH_PACKED 0b11001111100111101111111101110111111L // which enchantments need a second call
+
+__device__ int64_t next(int64_t& seed, int bits) {
+    seed = (seed * LCG_MUL + LCG_ADD) & LCG_MSK;
+    return seed >> (48 - bits);
 }
 
-__device__ int32_t next_int(int64_t* seed, int32_t bound) {
+__device__ int32_t next_int(int64_t& seed, int32_t bound) {
     if ((bound & -bound) == bound) {
         return (bound * next(seed, 31)) >> 31; // pow of 2
     }
-    int64_t bits;
+    int32_t bits;
     int32_t val;
     do {
         bits = next(seed, 31);
@@ -24,9 +28,21 @@ __device__ int32_t next_int(int64_t* seed, int32_t bound) {
     return val;
 }
 
-__device__ int32_t next_int_util(int64_t* seed, int32_t min, int32_t max) {
+__device__ int32_t next_int_util(int64_t& seed, int32_t min, int32_t max) {
     return min >= max ? min : min + next_int(seed, max-min+1);
 }
+
+__device__ int64_t next_long(int64_t& seed) {
+    return ((int64_t)next(seed, 32) << 32) + (int64_t)(int32_t)next(seed, 32);
+}
+
+__constant__ uint8_t d_table[MAX_LOOT_TABLE_SIZE]; // Adjust size to match your maximum table byte-size
+__constant__ uint8_t d_target[MAX_DISTINCT_ITEMS];
+__constant__ uint8_t d_distinct_items;
+__constant__ uint8_t d_popcnt;
+__constant__ uint32_t d_shuffle_order;
+__device__ uint32_t  d_match_count;
+__device__ uint32_t  d_correct_count;
 
 uint8_t* h_table;
 uint8_t* h_target;
@@ -34,85 +50,107 @@ uint8_t  h_distinct_items;
 uint8_t  h_popcnt;
 uint32_t h_shuffle_order;
 
-#define MAX_DISTINCT_ITEMS 20
-#define MAX_LOOT_TABLE_SIZE 256
+__device__ uint8_t can_spawn_desert_pyramid(int64_t seed_with_salt, int32_t mcx, int32_t mcz) {
+    int64_t seed = (seed_with_salt ^ LCG_MUL) & LCG_MSK;
+    return next_int(seed, 32 - 8) == mcx && next_int(seed, 32 - 8) == mcz;
+}
 
-__constant__ uint8_t d_table[MAX_LOOT_TABLE_SIZE]; // Adjust size to match your maximum table byte-size
-__constant__ uint8_t d_target[MAX_DISTINCT_ITEMS];
-__constant__ uint8_t d_distinct_items;
-__constant__ uint8_t d_popcnt;
-__constant__ uint32_t d_shuffle_order;
+__device__ int64_t get_lcg_feature_seed(int64_t world_seed, int32_t x, int32_t z, int index, int step, int calls) {
+    x = (x / 16) * 16;
+    z = (z / 16) * 16;
+    int64_t seed = (world_seed ^ LCG_MUL) & LCG_MSK;
+
+    int64_t a = next_long(seed) | 1, b = next_long(seed) | 1;
+    int64_t dec_seed = (x*a + z*b ^ world_seed) & LCG_MSK;
+    int64_t feature_seed = (dec_seed + index + 10000*step) & LCG_MSK;
+    feature_seed ^= LCG_MUL;
+    for (int _=0; _<calls; _++) next_long(feature_seed);
+    return next_long(feature_seed); 
+}
 
 
-
+template<uint8_t distinct_items>
 __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
-    uint64_t c0=0,c1=0,c2=0,c3=0;
-    int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ uint32_t s_table[MAX_LOOT_TABLE_SIZE];
+    for (int i=threadIdx.x; i<MAX_LOOT_TABLE_SIZE/4; i+=blockDim.x) s_table[i] = ((uint32_t*)d_table)[i];
+    __shared__ uint8_t s_target[distinct_items];
+    for (int i=threadIdx.x; i<distinct_items; i+=blockDim.x) s_target[i] = d_target[i];
+    __syncthreads();
+    int txg = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    for (uint64_t dseed=tx; dseed<num_seeds; dseed+=stride) {
+    int8_t loot[distinct_items];
+
+        int32_t x = 7984, z = 10480;
+        int spacing = 32, separation = 8, salt = 14357617;
+        int32_t cx = x/16, cz = z/16;
+        int32_t mcx = cx % spacing, mcz = cz % spacing;
+        int32_t rx = cx / spacing, rz = cz / spacing;
+        int64_t structure_salt = (rx*341873128712 + rz*132897987541 + salt);
+
+    for (uint64_t dseed=txg; dseed<num_seeds; dseed+=stride) {
+
         int64_t seed = seed_start+dseed;
-        uint8_t loot[MAX_DISTINCT_ITEMS] = {0}; // todo - size smartly. needs only distinct_items length
-        uint8_t* table_idx = d_table;
-        int num_pools = table_idx[0];
+
+        // TODO: fifo valid seeds for spawn OK
+        if (!can_spawn_desert_pyramid(seed + structure_salt, mcx, mcz)) continue;
+        int64_t feat_seed = get_lcg_feature_seed(seed, x, z, 3, 4, 0) & LCG_MSK;
+        seed = feat_seed ^ LCG_MUL;
+
+        for (int i=1;i<distinct_items; i++) loot[i] = s_target[i];
+        loot[0] = INT8_MAX; // don't want to break if 'empty' (id=0) rolled
+        uint32_t* table_idx = s_table; // aligned to 4-bytes:    [num_pools | pad | pad | pad] { [rmin | rmax | totweight(2-byte) ] { [item_id | qmin | qmax | ench] } }
+        int num_pools = table_idx[0] & 0xFF;
         table_idx += 1;
-        for (int pool_idx=0; pool_idx<num_pools; pool_idx++) {
-            int rmin = table_idx[0], rmax = table_idx[1];
-            int num_ent = table_idx[2];
-            table_idx += 3;
-            int tot_weight = 0;
-            for (int ent_idx=0; ent_idx<num_ent; ent_idx++) tot_weight += table_idx[5*ent_idx + 1];
-            int num_rolls = next_int_util(&seed, rmin, rmax);
-            for (int roll_num=0; roll_num<num_rolls; roll_num++) {
-                int cur_weight = 0, ent_idx=-1;
-                int targ_weight = next_int_util(&seed, 1, tot_weight);
-                do {
-                    cur_weight += table_idx[5*(++ent_idx) + 1];
-                } while (cur_weight < targ_weight);
-                int qmin = table_idx[5*ent_idx + 2], qmax = table_idx[5*ent_idx + 3], ench = table_idx[5*ent_idx + 4];
-                if (ench) {
-                    uint64_t ENCH_PACKED = 0b11001111100111101111111101110111111L; // which enchantments need a second call
-                    int ench_idx = next_int(&seed, 37);
-                    if ((ENCH_PACKED >> ench_idx) & 1) next_int(&seed, 1); // ignore result, for now
-                }
-                int qty = next_int_util(&seed, qmin, qmax);
-                loot[table_idx[5*ent_idx]] += qty;
-            }
-            table_idx += 5*num_ent;
-        }
         int match = 1;
-        for (int i=1; i<d_distinct_items; i++) { // start at 1 (ignore empty)
-            if (loot[i] != d_target[i]) match = 0;
-        }
-        if (match) {
-            uint8_t ind[27];
-            for (int i=0; i<27; i++) {
-                ind[i] = i;
+        for (int pool_idx=0; (pool_idx<num_pools)&&match; pool_idx++) {
+            uint32_t pool_stats = table_idx[0];
+            int rmin = pool_stats & 0xFF, rmax = (pool_stats >> 8) & 0xFF;
+            int tot_weight = pool_stats >> 16;
+            table_idx += 1;
+            int num_rolls = next_int_util(seed, rmin, rmax);
+            for (int roll_num=0; roll_num<num_rolls; roll_num++) {
+                int ent_idx = next_int_util(seed, 1, tot_weight)-1;
+                uint32_t entry_stats = table_idx[ent_idx];
+                int qmin = (entry_stats >> 8) & 0xFF, qmax = (entry_stats >> 16) & 0xFF, ench = (entry_stats >> 24);
+                if (ench) {
+                    int ench_idx = next_int(seed, 37);
+                    if ((ENCH_PACKED >> ench_idx) & 1) next_int(seed, 1); // ignore result (already have enough info w/o it)
+                }
+                int qty = next_int_util(seed, qmin, qmax);
+                if ((loot[entry_stats & 0xFF] -= qty) < 0) {
+                    match = 0;
+                    break;
+                };
             }
+            table_idx += tot_weight;
+        }
+        for (int i=1; (i<distinct_items)&&match; i++) { // start at 1 (ignore empty)
+            if (loot[i] != 0) match = 0;
+        }
+
+        if (match) {
+            atomicAdd(&d_match_count, 1);
+            uint8_t ind[27];
+            for (int i=0; i<27; i++) ind[i] = i;
             for (int i=27; i>1; i--) {
-                int j = next_int(&seed, i);
+                int j = next_int(seed, i);
                 uint8_t tmp = ind[j];
                 ind[j] = ind[i-1];
                 ind[i-1] = tmp;
             }
             int8_t correct = 1;
             for (int i=27-d_popcnt; i<27; i++) {
-                if (((d_shuffle_order >> ind[i]) & 1) == 0) {
-                    correct = 0;
-                    break;
-                }
+                if (((d_shuffle_order >> ind[i]) & 1) == 0) correct = 0;
             }
             if (correct) {
                 printf("%ld\n", seed_start+dseed);
+                atomicAdd(&d_correct_count, 1);
             }
         }
     }
-    if (tx == -1) {
-        int shift = 10;
-        printf("CLOCKS: %lu %lu %lu %lu\n", c0>>shift, c1>>shift, c2>>shift, c3>>shift);
-    }
 }
 
-void print_table(uint8_t* table) {
+void print_table(uint8_t* table) { //TODO - fix for new structure
     int idx=1;
     for (int pool_idx=0; pool_idx<table[0]; pool_idx++) {
         printf("[%d, %d]\n", table[idx+0], table[idx+1]);
@@ -133,22 +171,45 @@ void gpu_init(int64_t seed) {
     cudaMemcpyToSymbol(d_distinct_items, &h_distinct_items, sizeof(uint8_t));
     cudaMemcpyToSymbol(d_popcnt, &h_popcnt, sizeof(uint8_t));
     cudaMemcpyToSymbol(d_shuffle_order, &h_shuffle_order, sizeof(uint32_t));
-
+    cudaMemset(&d_match_count, 0, sizeof(uint32_t));
+    cudaMemset(&d_correct_count, 0, sizeof(uint32_t));
 
     printf("Launching kernel...\n");
-    check_loot_collision<<<1024, 256>>>(
-        seed, 1L<<32
-    );
+    const uint64_t NUM_SEEDS_TO_CHECK = 1L << 40;
+    #define CASE(n) case n: check_loot_collision<n><<<1024, 256>>>(seed, NUM_SEEDS_TO_CHECK); break;
+    switch (h_distinct_items) {
+        CASE(2);
+        CASE(3);
+        CASE(4);
+        CASE(5);
+        CASE(6);
+        CASE(7);
+        CASE(8);
+        CASE(9);
+        CASE(10);
+        CASE(11);
+        CASE(12);
+        CASE(13);
+        CASE(14);// TODO - parameterize discretely
+        CASE(15);
+        CASE(16);
+        default: printf("ERROR - input has more distinct items than this binary supports. Please recompile.\n"); exit(1);
+    }
 
     cudaDeviceSynchronize();
+
+    uint32_t h_match_count;
+    uint32_t h_correct_count;
+    cudaMemcpyFromSymbol(&h_match_count, d_match_count, sizeof(uint32_t));
+    cudaMemcpyFromSymbol(&h_correct_count, d_correct_count, sizeof(uint32_t));
+    printf("Checked %lu seeds.\nFound %u matches using items.\nFiltered to %u matches using the shuffle of empty slots.\n", NUM_SEEDS_TO_CHECK, h_match_count, h_correct_count);
 }
 
 int main() {
-    uint32_t shuffle_order = 0b000011101011111111111111000;
-int64_t seed = 6721027238469;
-uint8_t table[107] = {2, 2, 4, 15, 1, 5, 1, 3, 0, 2, 15, 1, 5, 0, 3, 15, 2, 7, 0, 4, 15, 1, 3, 0, 5, 25, 4, 6, 0, 6, 25, 1, 3, 0, 7, 25, 3, 7, 0, 8, 20, 1, 1, 0, 9, 15, 1, 1, 0, 10, 10, 1, 1, 0, 11, 5, 1, 1, 0, 12, 20, 1, 1, 1, 13, 20, 1, 1, 0, 14, 2, 1, 1, 0, 0, 15, 1, 1, 0, 4, 4, 5, 5, 10, 1, 8, 0, 15, 10, 1, 8, 0, 7, 10, 1, 8, 0, 16, 10, 1, 8, 0, 17, 10, 1, 8, 0};
-uint8_t target[18] = {0, 0, 0, 0, 0, 17, 0, 0, 1, 0, 0, 0, 2, 0, 0, 2, 0, 3};
-int distinct_items = 18;
+uint32_t shuffle_order = 0b011100111011101100001001101;
+uint8_t table[1140] = {2, 0, 0, 0, 2, 4, 232, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 4, 4, 50, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0};
+uint8_t target[8] = {0, 0, 4, 3, 5, 1, 1, 6};
+int distinct_items = 8;
     int popcnt = 0;
     for (int i=0; i<27; i++) popcnt += ((shuffle_order >> i)&1);
     if (distinct_items > MAX_DISTINCT_ITEMS) {
@@ -162,7 +223,8 @@ int distinct_items = 18;
     h_popcnt = popcnt;
     h_shuffle_order = shuffle_order;
 
-    print_table(table);
+//    print_table(table);
+    int seed = 0;
     gpu_init(seed & 0xFFFFFFFF00000000L);
 
     return 0;

@@ -1,5 +1,6 @@
 import json
-
+from extract import get_chest_loot_table
+from enchants import get_random_enchant
 class JavaRandom:
     def __init__(self,seed):
         self.seed=(seed ^ 0x5DEECE66D) & ((1 << 48) - 1)
@@ -25,7 +26,7 @@ class JavaRandom:
         return _+__
     def next_bool(self):
         return self.next(1)!=0
-    def nextFloat(self):
+    def next_float(self):
         return self.next(24)/(1<<24)
     def prev(self):
         self.seed=(self.seed*0xdfe05bcb1365+0x615c0e462aa9)&((1<<48)-1)
@@ -152,35 +153,25 @@ def process_loot_pool(pool, rng):
                 if tot_weight > pick: break
         if 'functions' in entry:
             assert len(entry['functions']) == 1
-            if entry['functions'][0]['function'] == 'minecraft:enchant_randomly':
-                enchantments = [
-                    "protection", "fire_protection", "feather_falling", "blast_protection",
-                    "projectile_protection", "respiration", "aqua_affinity", "thorns",
-                    "depth_strider", "frost_walker", "binding_curse", "sharpness", "smite",
-                    "bane_of_arthropods", "knockback", "fire_aspect", "looting", "sweeping",
-                    "efficiency", "silk_touch", "unbreaking", "fortune", "power", "punch",
-                    "flame", "infinity", "luck_of_the_sea", "lure", "loyalty", "impaling",
-                    "riptide", "channeling", "multishot", "quick_charge", "piercing",
-                    "mending", "vanishing_curse"
-                ]
-                enchant_data = {
-                    "protection": 4, "fire_protection": 4, "feather_falling": 4,
-                    "blast_protection": 4, "projectile_protection": 4, "respiration": 3,
-                    "aqua_affinity": 1, "thorns": 3, "depth_strider": 3, "frost_walker": 2,
-                    "binding_curse": 1, "sharpness": 5, "smite": 5, "bane_of_arthropods": 5,
-                    "knockback": 2, "fire_aspect": 2, "looting": 3, "sweeping": 3,
-                    "efficiency": 5, "silk_touch": 1, "unbreaking": 3, "fortune": 3,
-                    "power": 5, "punch": 2, "flame": 1, "infinity": 1, "luck_of_the_sea": 3,
-                    "lure": 3, "loyalty": 3, "impaling": 5, "riptide": 3, "channeling": 1,
-                    "multishot": 1, "quick_charge": 3, "piercing": 4, "mending": 1,
-                    "vanishing_curse": 1
-                }
-                idx = rng.next_int(len(enchantments))
-                enchant = enchantments[idx]
-                level = r_int(rng, 1, enchant_data[enchant])
+            function = entry['functions'][0]['function']
+            if function == 'minecraft:enchant_randomly':
+                enchant,max_level = get_random_enchant(entry['name'], rng)
+#                print(enchantments)
+#                idx = rng.next_int(len(enchantments))
+#                enchant,max_level = enchantments[idx]
+                level = r_int(rng, 1, max_level)
                 print(enchant, level)
                 qty = 1
-            elif entry['functions'][0]['function'] == 'minecraft:set_count':
+            elif function == 'minecraft:set_stew_effect':
+                effects = entry['functions'][0]['effects']
+                effect = effects[r_int(rng, 0, len(effects)-1)]
+                emin = effect['duration']['min']
+                emax = effect['duration']['max']
+                assert int(emin) == emin and int(emax) == emax
+                duration = r_int(rng, int(emin), int(emax))
+                print(f"Stew {effect['type']}. Duration {duration}s.")
+                qty = 1
+            elif function == 'minecraft:set_count':
                 assert entry['functions'][0]['count']['type'] == 'minecraft:uniform'
                 qmin = entry['functions'][0]['count']['min']
                 qmax = entry['functions'][0]['count']['max']
@@ -189,6 +180,8 @@ def process_loot_pool(pool, rng):
                 qmax = int(qmax)
                 qty = qmin + rng.next_int(qmax - qmin + 1)
             else:
+                print("Bad Entry Function")
+                print(entry)
                 raise ValueError
         else:
             qty = 1
@@ -253,3 +246,49 @@ def shuffle_and_split(stacks, rng, container_size=27):
     output = [None]*27
     for idx,stack in zip(indices[::-1],stacks): output[idx] = stack
     return output
+
+def loottable_c(table, loot_item_counts):
+    lookup = {'minecraft:empty':0, 'miss':1}
+    table = get_chest_loot_table(table)
+    assert table['type'] == 'minecraft:chest'
+    pools = table['pools']
+    output = [len(pools),0,0,0] #     #pools < rmin rmax #entries totweight [ name weight qmin qmax ench ] >
+                          #     #pools pad pad pad < rmin rmax #entries totweight [ name qmin qmax ench ] > 
+    for pool in pools: #                                                ^ for each possible targ weight
+        rolls = pool['rolls']
+        if type(rolls) is int:
+            output.extend([rolls, rolls])
+        elif type(rolls) is dict:
+            rmin = rolls['min']
+            rmax = rolls['max']
+            assert rolls['type'] == 'minecraft:uniform'
+            assert int(rmin) == rmin and int(rmax) == rmax
+            output.extend([int(rmin), int(rmax)])
+        else:
+            raise ValueError
+        entries = pool['entries']
+        tot_weight = sum(entry.get('weight', 1) for entry in entries)
+        output.append(tot_weight&0xFF)
+        output.append(tot_weight>>8)
+        for entry in entries:
+            ## TODO: account for enchantment filtering
+            name = 'minecraft:empty' if entry['type'] == 'minecraft:empty' else (entry['name'] if entry['name'] in loot_item_counts else 'miss')
+            if name not in lookup: lookup[name] = len(lookup)
+            item_id = lookup[name]
+            if 'functions' in entry:
+                assert len(entry['functions']) == 1
+                if entry['functions'][0]['function'] == 'minecraft:enchant_randomly':
+                    entry_stats = [item_id, 1, 1, 1]
+                elif entry['functions'][0]['function'] == 'minecraft:set_count':
+                    assert entry['functions'][0]['count']['type'] == 'minecraft:uniform'
+                    qmin = entry['functions'][0]['count']['min']
+                    qmax = entry['functions'][0]['count']['max']
+                    assert int(qmin) == qmin and int(qmax) == qmax
+                    entry_stats = [item_id, int(qmin), int(qmax), 0]
+                else:
+                    raise ValueError
+            else:
+                entry_stats = [item_id, 1, 1, 0]
+            output.extend(entry_stats*entry.get('weight', 1))
+    assert max(output) < 256
+    return output, lookup
