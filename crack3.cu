@@ -62,7 +62,7 @@ __constant__ int32_t d_feature_seed_info[4];
 __device__ unsigned long long  d_match_counts[4];
 __constant__ int64_t  d_spawn_checks[MAX_SPAWN_CHECKS*4];
 __constant__ uint8_t d_num_spawn_checks;
-__constant__ int64_t d_buried_treasure_float;
+__constant__ int64_t d_prng_first_call_salt;
 
 uint8_t* h_table;
 uint8_t* h_target;
@@ -72,7 +72,7 @@ uint32_t h_shuffle_order;
 int32_t* h_feature_seed_info;
 int64_t* h_spawn_checks;
 uint8_t h_num_spawn_checks;
-uint64_t h_buried_treasure_float;
+uint64_t h_prng_first_call_salt;
 uint64_t h_match_counts[4];
 
 __device__ int64_t reverse_prng_call(int64_t rng_out, int64_t packed_info) {
@@ -135,7 +135,7 @@ __global__ void check_loot_collision(uint32_t test_kernel) {
     uint64_t spawn_ok_count = 0;
 
     const int32_t x = d_feature_seed_info[0], z = d_feature_seed_info[1], index = d_feature_seed_info[2], step = d_feature_seed_info[3];
-    const uint64_t bt_reverse_float_accel = d_buried_treasure_float;
+    const uint64_t prng_first_call_salt = d_prng_first_call_salt;
 /*
     int64_t aa = 7577095897946LL;
     for (int64_t u = 17+24*tx; u < (1LL << 31); u += 24*stride) {
@@ -156,7 +156,7 @@ __global__ void check_loot_collision(uint32_t test_kernel) {
     int64_t inner_lb, inner_ub, inner_stride;
     int64_t outer_lb, outer_ub, outer_stride;
 
-    switch (bt_reverse_float_accel >> 48) {
+    switch (prng_first_call_salt >> 48) {
         case DESERT_TEMPLE:
             inner_lb = 0, inner_ub = (1LL<<17), inner_stride = (test_kernel ? test_kernel : 1);
             outer_lb = (17LL + 24*tx)<<17, outer_ub = (1LL << 48), outer_stride = (24LL*stride)<<17;
@@ -174,7 +174,7 @@ __global__ void check_loot_collision(uint32_t test_kernel) {
     atomicAdd(d_match_counts+0, ((outer_ub - outer_lb - 1) / outer_stride + 1) * ((inner_ub - inner_lb - 1) / inner_stride + 1));
     for (int64_t oi = outer_lb; oi < outer_ub; oi += outer_stride) {
         for (int64_t ii = inner_lb; ii < inner_ub; ii += inner_stride) {
-            wseed = reverse_prng_call(oi + ii, bt_reverse_float_accel);
+            wseed = reverse_prng_call(oi + ii, prng_first_call_salt);
             uint8_t spawn_ok = 1;
             for (int j=0; j<d_num_spawn_checks && spawn_ok; j++) {
                 spawn_ok &= spawn_check(wseed, s_spawn_checks[j]);
@@ -253,7 +253,7 @@ void gpu_init() {
     cudaMemcpyToSymbol(d_num_spawn_checks, &h_num_spawn_checks, sizeof(uint8_t));
     cudaMemcpyToSymbol(d_spawn_checks, h_spawn_checks, 4*sizeof(int64_t)*MAX_SPAWN_CHECKS);
     cudaMemcpyToSymbol(d_feature_seed_info, h_feature_seed_info, 4*sizeof(int32_t));
-    cudaMemcpyToSymbol(d_buried_treasure_float, &h_buried_treasure_float, sizeof(uint64_t));
+    cudaMemcpyToSymbol(d_prng_first_call_salt, &h_prng_first_call_salt, sizeof(uint64_t));
     cudaMemset(&d_match_counts, 0, 4*sizeof(unsigned long long));
 //    cudaMemset(&d_correct_count, 0, sizeof(uint32_t));
 //    cudaMemset(&d_spawn_ok_count, 0, sizeof(uint64_t));
@@ -288,11 +288,9 @@ uint8_t table[1140] = {2, 0, 0, 0, 2, 4, 232, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3
 uint8_t target[7] = {0, 0, 16, 8, 1, 1, 2};
 int distinct_items = 7;
 int32_t feature_seed_info[4] = {7452, 10970, 3, 4}; // x, z, index, step
-int64_t buried_treasure_float = 7577095897946LL;
-
-int64_t spawns_checks[12] = {7984, 10480, DESERT_TEMPLE, 0, 7450, 10968, DESERT_TEMPLE};
-int num_spawn_checks = 2;
-//uint64_t buried_treasure_float = 1153169326606791148LL; // 75998109126254LL
+int64_t prng_first_call_salt = 529296976654828LL;
+int64_t spawns_checks[4] = {7452, 10970, 0, 0};
+int num_spawn_checks = 1;
     int popcnt = 0;
     for (int i=0; i<27; i++) popcnt += ((shuffle_order >> i)&1);
     if (distinct_items > MAX_DISTINCT_ITEMS) {
@@ -319,7 +317,7 @@ int num_spawn_checks = 2;
             printf("WARNING - unknowns structure type for spawn checking given at x=%d, z=%d.\n", x, z);
         }
     }
-    if (buried_treasure_float == 0) {
+    if (prng_first_call_salt == 0) {
         printf("WARNING - you are running the cracker without a buried treasure position. This will increase the runtime by ~100x.\n");
     }
     // todo: check for loot table too large
@@ -331,7 +329,7 @@ int num_spawn_checks = 2;
     h_num_spawn_checks = num_spawn_checks;
     h_spawn_checks = spawns_checks;
     h_feature_seed_info = feature_seed_info;
-    h_buried_treasure_float = buried_treasure_float;
+    h_prng_first_call_salt = prng_first_call_salt;
 
 
     gpu_init();

@@ -48,8 +48,16 @@ def likelihood(table, items):
     return prob(tuple(qtys), -1, 0)
 
 def entropy(table, items, chest):
-    p1 = likelihood(load_all_tables()[table], items)
-    p2 = 1 / comb(27, sum(e[0] is None for e in chest))
-    h1 = -log2(p1)
-    h2 = -log2(p2)
-    return h1,h2
+    p1 = likelihood(load_all_tables()[table], items) # item quantities
+    p2 = 1 / comb(27, sum(e[0] is None for e in chest)) # empty/occupied positions
+    p3 = 1 / {'desert_pyramid':576, 'buried_treasure':100, 'ruined_portal':625}.get(table, 1) # structure spawn chance
+    p4 = 1 / {'desert_pyramid':24, 'buried_treasure':100, 'ruined_portal':25}.get(table, 1) # fast PRNG reversal sparsity
+    def h(p):
+        if p == 0: return float('inf')
+        if p == 1: return 0.0
+        return -log2(p)
+    h1 = h(p1)
+    h2 = h(p2)
+    h3 = h(p3)
+    h4 = h(p4)
+    return h1,h2,h3,h4

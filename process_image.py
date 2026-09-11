@@ -11,7 +11,7 @@ from extract import load_ascii
 
 
 
-def process_image(path):
+def process_image(path, prompt_uncertain=True, verbose=False):
     def ocr(img_arr, x0, y0, alphabet, text_color, color_tolerance=1, max_consec_spaces=0):
         result = ""
         consec_spaces = -1
@@ -67,16 +67,16 @@ def process_image(path):
     if not path.lower().endswith('.png'):
         raise ValueError("File must end with .png")
 
-    print(f'Processing image {path}')
+    if verbose: print(f'Processing image {path}')
     im = Image.open(path).convert('RGBA')
     il = im.load()
 
     w,h = im.size
     scale = sum(il[x,h//2] == (0,0,0,255) for x in range(w//2))
     if not 1 <= scale <= 8:
-        print(f"Container GUI not detected in {path}.")
-        return
-    print(f"Detected GUI scale = {scale}.")
+        if verbose: print(f"Container GUI not detected in {path}.")
+        return None
+    if verbose: print(f"Detected GUI scale = {scale}.")
 
     for x1 in range(w): # Container GUI boundaries
         if il[x1, h//2] == (0,0,0,255): break
@@ -84,9 +84,9 @@ def process_image(path):
         if il[w//2, y1] == (0,0,0,255): break
 
 
-    tables = load_all_tables()
+    all_tables = load_all_tables()
     all_items = set()
-    for table in tables.values():
+    for table in all_tables.values():
         for _,entries in table:
             for entry in entries:
                 name = entry[0][0]
@@ -110,9 +110,9 @@ def process_image(path):
     coords = re.findall(r'.*?(\d+), (\d+), (\d+)$', coords)
     if coords:
         ssx,ssy,ssz = map(int,coords[0])
-        print(f"Found targeted block coordinates: {ssx}, {ssy}, {ssz}.")
+        if verbose: print(f"Found targeted block coordinates: {ssx}, {ssy}, {ssz}.")
     else:
-        print("Failed to extract targeted block coords. Is F3 showing?")
+        if verbose: print("Failed to extract targeted block coords. Is F3 showing?")
 
     contents = []
     for cy in range(3):
@@ -122,7 +122,7 @@ def process_image(path):
             slot = im.crop((px, py, px+16*scale, py+16*scale))
             conf,item,qty = get_match(slot)
             if item is None:
-                if conf != 1:
+                if prompt_uncertain and conf != 1:
                     while True:
                         inp = input(f"Failed to detect item in row {cy}, column {cx}. Enter the item and quantity (ex. 'leather_chestplate,1'): ").replace(' ','')
                         if inp.count(',') == 1:
@@ -138,8 +138,18 @@ def process_image(path):
     for item,qty in contents:
         if item is None: continue
         distinct_content_items[item] = qty + distinct_content_items.get(item, 0)
-    print(distinct_content_items)
+    if verbose: print(distinct_content_items)
 
+
+    possible_tables = []
+    for tname,table in all_tables.items():
+        t_items = set()
+        for _,entries in table:
+            for entry in entries:
+                if entry[0][0]: t_items.add(entry[0][0])
+        if all(item in t_items for item in distinct_content_items):
+            possible_tables.append(tname)
+    if verbose: print(f"The detected loot can generate in the following structures: {possible_tables}.")
 
     im_cropped_to_container = im.crop((x1, y1, x1+scale*((1 + 2 + 4 + 1)*2 + (1 + 16 + 1)*9), y1+scale*((1 + 2 + 14 + 1)*2 + (1 + 16 + 1)*3)))
-    return ((ssx,ssy,ssz) if coords else None), contents, distinct_content_items, im_cropped_to_container
+    return ((ssx,ssy,ssz) if coords else None), contents, distinct_content_items, possible_tables, im_cropped_to_container
