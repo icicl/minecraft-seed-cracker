@@ -1,4 +1,4 @@
-import os, glob, ctypes, platform, sys
+import os, glob, ctypes, platform, sys, time
 import numpy as np
 from multiprocessing import Process
 
@@ -25,6 +25,7 @@ def print_table_row(vals,widths):
         print('| ' + ' | '.join(f'{val:<{width}}' for val,width in zip(vals,widths)) + ' |')
 
 def get_info(ss_dir, ss_count=10):
+    t0 = time.time()
     candidates = []
 
     col_widths = [4,30,50,18,18,30]
@@ -47,10 +48,11 @@ def get_info(ss_dir, ss_count=10):
             ],col_widths)
     print_table_row(None,col_widths)
 
-    print(f"Detected {len(candidates)} screenshots with loot inventories:")
+    print_table_row([f"Detected {len(candidates)} screenshots with loot inventories:"], [sum(col_widths)+3*len(col_widths)-3])
     print_table_row(None,col_widths)
-    print('Enter a comma-separated list of structures to use for filtering step.\n' \
-        'The first structure will be used for the loot-based cracking.'
+    print(f"{time.time() - t0:.2f}s")
+    print('\nEnter a comma-separated list of structures to use for filtering step.\n' \
+        'The first structure will be used for the loot-based cracking.\n'
         'This step is much faster than the full loot-based cracker.\n' \
         'I recommend at least 16 bits of [F] entropy.\n' \
         'The structure with the largest [R] entropy will be used for fast iteration over reversal of initial PRNG calls.' \

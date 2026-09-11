@@ -1,8 +1,13 @@
-import os, zipfile, re, string
+import os, zipfile, re, string, xxhash, time
 from PIL import Image
 import numpy as np
 
 from extract import load_all_tables, load_atlas, load_ascii
+
+
+def arrhash(arr):
+    arr = np.ascontiguousarray(arr)
+    return xxhash.xxh3_64(arr.data).intdigest()
 
 
 def get_chars():
@@ -100,7 +105,7 @@ def process_image(path, prompt_uncertain=True, verbose=False):
                 if dx < 0: continue
                 dy = y0
                 masked = np.where(glyph, img_arr[dy:dy+glyph.shape[0],dx:dx+glyph.shape[1]].sum(axis=-1), 0).astype(int)
-                if np.where(masked, abs(masked - (255 + 3*text_color)) <= 3*color_tolerance, 0).sum() == glyph.sum():
+                if np.where(masked, abs(masked - (3*text_color)) <= 3*color_tolerance, 0).sum() == glyph.sum():
                     if match is None or glyph.sum() > match[1]:
                         match = (char, glyph.sum(), scale + + glyph.shape[1])
             if match:
@@ -113,35 +118,47 @@ def process_image(path, prompt_uncertain=True, verbose=False):
                 result += ' '
         return result[::-1].strip()
 
-
+    match_cache = {}
     def get_match(slot):
-        slot_arr = np.array(slot)
-        slot_mask = np.where(abs(slot_arr - slot_arr[0,0]).sum(axis=-1) != 0, True, False)
-        is_empty = abs(slot_arr - slot_arr[0,0]).sum() == 0
+        slot_arr_full = np.array(slot)
+        slot_arr = slot_arr_full.reshape(-1,slot_arr_full.shape[2])
+        if slot_arr.shape[1] == 4: slot_arr = slot_arr[:,:3] # RGBA -> RGB
+        is_empty = abs(slot_arr - slot_arr[0]).sum() == 0
         if is_empty:
             return 1,None,0
-        idx = 0
+        h = arrhash(slot_arr)
+        if h in match_cache: return match_cache[h]
+        slot_mask = np.where(abs(slot_arr - slot_arr[0]).sum(axis=-1) != 0, True, False)
         best_score = 0.25
         best = None
         best_silh = (0,None)
-        for x in range(0,16*16*scale, 16*scale):
-            for y in range(0, 16*16*scale, 16*scale):
-                if idx < len(all_items):
-                    tex = atlas_arr[x:x+16*scale,y:y+16*scale]
-                    mask = np.where(tex[:,:,-1] == 255, True, False)
-                    diff_sq = (mask[:,:,None] * (tex - slot_arr))**2
-                    near_matches = ((diff_sq.sum(axis=-1) <= 3) * mask).sum() # each pixel can miss by up to 1
-                    score = near_matches / mask.sum()
-                    mask_similarity = (slot_mask*mask).sum() / (mask | slot_mask).sum()
-                    if score > best_score:
-                        best_score, best = score, all_items[idx]
-                    best_silh = min(best_silh, (-mask_similarity, all_items[idx]))
-                idx += 1
-        qty = ocr_qty(slot_arr, 16*scale, 16*scale-7*scale, '0123456789', 252)
+        diffs = textures - slot_arr
+        diffs = diffs.reshape(256,-1,3)
+        diff_sqs = (diffs)**2
+        near_matches = ((diff_sqs.sum(axis=-1) <= 3) & texture_opacity_masks)
+        near_matches = near_matches.sum(axis=(1))
+
+        scores = near_matches / texture_opacity_masks.sum(axis=(1))
+        mask_similarities = (
+            np.count_nonzero(slot_mask & texture_opacity_masks, axis=(1)) /
+            np.count_nonzero(slot_mask | texture_opacity_masks, axis=(1))
+        )
+        for idx in range(len(all_items)):
+                score = scores[idx]
+                mask_similarity = mask_similarities[idx]
+                if score > best_score:
+                    best_score, best = score, all_items[idx]
+                best_silh = min(best_silh, (-mask_similarity, all_items[idx]))
+        qty = ocr_qty(slot_arr_full, 16*scale, 16*scale-7*scale, '0123456789', 252)
         qty = int(qty) if qty else 1
+
         if best is None and best_silh[0] == -1:
-            return -1, best_silh[1], qty
-        return round(best_score,3), best, qty
+            result = -1, best_silh[1], qty
+        else:
+            result = round(best_score,3), best, qty
+        match_cache[h] = result
+        return result
+
 
 
     if os.path.isdir(path):
@@ -150,21 +167,29 @@ def process_image(path, prompt_uncertain=True, verbose=False):
         raise ValueError("File must end with .png")
 
     if verbose: print(f'Processing image {path}')
-    im = Image.open(path).convert('RGBA')
+    im = Image.open(path)
+    if im.mode == "RGB":
+        black = (0,0,0)
+    elif im.mode == "RGBA":
+        black = (0,0,0,255)
+    else:
+        im = im.convert('RGB')
+        black = (0,0,0)
     il = im.load()
+    im_arr = np.array(im)
+    if im_arr.shape[2] == 4: im_arr = im_arr[:,:,:3] # RBGA -> RGB
 
     w,h = im.size
-    scale = sum(il[x,h//2] == (0,0,0,255) for x in range(w//2))
+    scale = sum(il[x,h//2] == black for x in range(w//2))
     if not 1 <= scale <= 8:
         if verbose: print(f"Container GUI not detected in {path}.")
         return None
     if verbose: print(f"Detected GUI scale = {scale}.")
 
     for x1 in range(w): # Container GUI boundaries
-        if il[x1, h//2] == (0,0,0,255): break
+        if il[x1, h//2] == black: break
     for y1 in range(h):
-        if il[w//2, y1] == (0,0,0,255): break
-
+        if il[w//2, y1] == black: break
 
     all_tables = load_all_tables()
     all_items = set()
@@ -176,8 +201,14 @@ def process_image(path, prompt_uncertain=True, verbose=False):
                     all_items.add(name)
     all_items = sorted(all_items)
 
+    tilesize = scale*16
     atlas = load_atlas(scale, all_items)
     atlas_arr = np.array(atlas)
+    textures = atlas_arr[:,:,:3].reshape(16,tilesize,16,tilesize,3).swapaxes(1,2).reshape(256,tilesize,tilesize,3)
+    texture_opacity_masks = (atlas_arr[:,:,-1] == 255).reshape(16,tilesize,16,tilesize).swapaxes(1,2).reshape(256,tilesize,tilesize)
+    textures = textures.reshape(256,-1,3)
+    texture_opacity_masks = texture_opacity_masks.reshape(256,-1)
+
 
     ascii_np = np.array(load_ascii().resize((8*16*scale, 8*16*scale), Image.Resampling.NEAREST))
     chars = {}
@@ -192,7 +223,7 @@ def process_image(path, prompt_uncertain=True, verbose=False):
 #    coords = get_coords(im, scale)
 #    if coords:
 #        ssx,ssy,ssz = coords
-    coords = ocr_qty(np.array(im), w-3*scale, 92*scale, '-0123456789,', 62, 13, 1)
+    coords = ocr_qty(im_arr, w-3*scale, 92*scale, '-0123456789,', 62, 13, 1)
     coords = re.findall(r'.*?(\-?\d+), (\-?\d+), (\-?\d+)$', coords)
     if coords:
         ssx,ssy,ssz = map(int,coords[0])
@@ -208,7 +239,7 @@ def process_image(path, prompt_uncertain=True, verbose=False):
             slot = im.crop((px, py, px+16*scale, py+16*scale))
             conf,item,qty = get_match(slot)
             if conf == -1:
-                print(f"Detected enchanted item {item} in row {cy+1}, column {cx+1}. Please ensure this is correct, as the enchantment glint can interfere with detection.")
+                if verbose: print(f"Detected enchanted item {item} in row {cy+1}, column {cx+1}. Please ensure this is correct, as the enchantment glint can interfere with detection.")
             if item is None:
                 if prompt_uncertain and conf != 1:
                     while True:

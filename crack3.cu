@@ -195,7 +195,7 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
                             int ent_idx = next_int_util(seed, 1, tot_weight);
                             uint32_t entry_stats = table_idx[ent_idx]; // table is a LUT - each possible chosen cum. weight has an entry for the corresponding item. This info is calculated in the invoking python
                             int qmin = (entry_stats >> 8) & 0xFF, qmax = (entry_stats >> 16) & 0xFF, ench = (entry_stats >> 24);
-                            if (ench) { // TODO -- acount for tool/armor filtering
+                            if (ench) {
                                 uint64_t ench_call_info = d_enchant_callcounts[ench];
                                 uint8_t valid_num_tools = ench_call_info >> 56;
                                 int ench_idx = next_int(seed, valid_num_tools);
@@ -263,7 +263,18 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
                                 match &= (split[i] == d_split_stacks[ind[26-i]]);
                             }
                             if (match) {
-                                printf("\rFound match: \e[0;32m%ld\e[0m                                              \n", wseed);
+                                printf("\rFound match for 48-bit loot table seed: \e[1;35m%ld\e[0m                                              \n", wseed);
+                                if ((wseed >> 32) == 0) printf("  -> Possible world seed, if seed was entered as a string (hashed to int32): \e[1;33m%ld\e[0m\n", wseed);
+                                uint64_t s2_47_16 = wseed & 0xFFFFFFFF;
+                                int32_t s1_31_16 = wseed >> 32;
+                                if (s2_47_16 >= (1LL<<31)) s1_31_16++;
+                                for (int32_t s2_15_0=0; s2_15_0 < (1<<16); s2_15_0++) {
+                                    uint64_t prev = (((s2_47_16 << 16) | s2_15_0)*0xdfe05bcb1365LL + 0x615c0e462aa9) & LCG_MSK;
+                                    if (((prev >> 16) & 0xFFFF) == s1_31_16) {
+                                        int64_t seed64 = (((prev >> 16) & 0xFFFFFFFF) << 32) + (int32_t)s2_47_16;
+                                        printf("  -> Possible world seed, if world was randomly generated: \e[1;33m%ld\e[0m\n", seed64);
+                                    }
+                                }
                                 atomicAdd(d_match_counts+4, 1);
                             }
                         }
@@ -330,7 +341,7 @@ void dispatch(
     } while (timer < 200000);
 
     printf("Test kernel finished in %.1fms\n",(float)timer / 1000);
-    printf("Estimated time to check all seeds: \e[0;35m%.1fs\e[0m\n\n", (float)timer / 1000000 * test_kernel_size);
+    printf("Estimated time to check all seeds: \e[1;34m%.1fs\e[0m\n\n", (float)timer / 1000000 * test_kernel_size);
 
     printf("Launching full kernel...\n");
     timer = -time_us();
@@ -343,5 +354,5 @@ void dispatch(
     }
     uint64_t h_match_counts[5];
     cudaMemcpyFromSymbol(&h_match_counts, d_match_counts, 5*sizeof(unsigned long long*));
-    printf("Checked %lu seeds. \n%lu passed structure spawn check.\nFiltered to %lu matches using item quantities in loot.\nFurther filtered to %lu matches using the shuffle of empty slots. Reduced to %lu using the exact split+shuffle of items.\n", h_match_counts[0], h_match_counts[1], h_match_counts[2], h_match_counts[3], h_match_counts[4]);
+    printf("\n\nChecked \e[1;37m%lu\e[0m seeds. \n\e[1;37m%lu\e[0m passed structure spawn check.\nFiltered to \e[1;37m%lu\e[0m matches using item quantities in loot.\nFurther filtered to \e[1;37m%lu\e[0m matches using the shuffle of empty slots.\nReduced to \e[1;37m%lu\e[0m final seeds using the exact split+shuffle of items.\n", h_match_counts[0], h_match_counts[1], h_match_counts[2], h_match_counts[3], h_match_counts[4]);
 }

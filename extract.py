@@ -124,6 +124,7 @@ def load_atlas(scale, itemlist):
     return atlas
 
 
+@cache
 def load_ascii():
     path = 'assets/minecraft/textures/font/ascii.png'
     with zipfile.ZipFile(zf, 'r') as z:
