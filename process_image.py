@@ -274,5 +274,5 @@ def process_image(path, prompt_uncertain=True, verbose=False):
             possible_tables.append(tname)
     if verbose: print(f"The detected loot can generate in the following structures: {possible_tables}.")
 
-    im_cropped_to_container = im.crop((x1, y1, x1+scale*((1 + 2 + 4 + 1)*2 + (1 + 16 + 1)*9), y1+scale*((1 + 2 + 14 + 1)*2 + (1 + 16 + 1)*3)))
-    return ((ssx,ssy,ssz) if coords else None), contents, distinct_content_items, possible_tables, im_cropped_to_container
+#    im_cropped_to_container = im.crop((x1, y1, x1+scale*((1 + 2 + 4 + 1)*2 + (1 + 16 + 1)*9), y1+scale*((1 + 2 + 14 + 1)*2 + (1 + 16 + 1)*3)))
+    return ((ssx,ssy,ssz) if coords else None), contents, possible_tables

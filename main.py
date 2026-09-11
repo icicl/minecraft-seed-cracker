@@ -1,6 +1,7 @@
-import os, glob, ctypes, platform, sys, time
+import os, glob, ctypes, platform, sys, time, shutil, re
 import numpy as np
 from multiprocessing import Process
+from datetime import datetime
 
 from process_image import process_image
 from loot import loottable_c
@@ -17,6 +18,26 @@ salts = { # step, index, feat seed, grid-based spacing, enum index, spawn check 
 #    'woodland_mansion':(1,4),
 #    'jungle_temple':(,,14357619,16*32,,(0,32))
 }
+
+def print_container(contents):
+    cols = shutil.get_terminal_size().columns
+    cell_w = (cols - 10) // 9
+    max_w = 10
+    cell_w = min(max_w, cell_w)
+    print('+' + '+'.join('-'*cell_w for _ in range(9)) + '+')
+    for row in range(3):
+        words = [[] for _ in range(9)]
+        for idx,(item,qty) in enumerate(contents[9*row:9*(row+1)]):
+            if item is None: continue
+            for word in item.replace('minecraft:','').split('_'):
+                words[idx].append(word)
+            words[idx].append(str(qty))
+        for i in range(cell_w//2):
+            print('|' + '|'.join(f'{words[j][i][:cell_w]: ^{cell_w}}' if len(words[j])>i else ' '*cell_w for j in range(9)) + '|')
+        print('+' + '+'.join('-'*cell_w for _ in range(9)) + '+')
+        
+            
+
 
 def print_table_row(vals,widths):
     if vals is None: # print the horizontal divider
@@ -35,9 +56,9 @@ def get_info(ss_dir, ss_count=10):
     for file in sorted(glob.glob(ss_dir + '*.png'))[-ss_count:]:
         processed = process_image(file, prompt_uncertain=False)
         if processed is None: continue
-        coords, contents, loot_item_counts, possible_tables, cropped = processed
+        coords, contents, possible_tables = processed
         possible_tables = [table for table in possible_tables if sum(entropy(table)) < float('inf')]
-        candidates.append((file[len(ss_dir):],coords,possible_tables,loot_item_counts,contents))
+        candidates.append((file[len(ss_dir):],coords,possible_tables))
         print_table_row([
             len(candidates),
             file[len(ss_dir):],
@@ -67,7 +88,7 @@ def get_info(ss_dir, ss_count=10):
                     break
         candidate_used_for_loot_cracking = None
         for idx in ids:
-            file,coords,possible_tables,loot,contents = candidates[idx-1]
+            file,coords,possible_tables = candidates[idx-1]
             if len(possible_tables) != 1:
                 print(f"Skipping ID# {idx} - Ambiguous structure type.")
                 continue
@@ -85,7 +106,7 @@ def get_info(ss_dir, ss_count=10):
     return candidate_used_for_loot_cracking, spawn_checks
 
 
-def process_info_for_cuda(spawn_checks_in, loot_container):
+def process_info_for_cuda(spawn_checks_in, loot_container, loot_spawn):
     seen_cc = set()
     best_h4 = 0
     total_h3 = 0
@@ -122,45 +143,105 @@ def process_info_for_cuda(spawn_checks_in, loot_container):
             print(f"WARNING: unimplemented structure spawn check type {spawn_check_type}. Skipping...")
         seen_cc.add((x//16,z//16))
     if skip_prng_reverse_feature is not None: del spawn_checks[skip_prng_reverse_feature]
-    return spawn_checks, feat_seed_base
 
-def run(ss_dir, ss_count):
-    if not ss_dir.endswith('/'): ss_dir += '/'
-    file, spawn_checks = get_info(ss_dir, ss_count)
-    coords, contents, loot, possible_tables, cropped = process_image(ss_dir + file, prompt_uncertain=True)
-    possible_tables = [table for table in possible_tables if sum(entropy(table)) < float('inf')]
-    spawn_checks, feat_seed_base = process_info_for_cuda(spawn_checks, None)
+    table,x,z = loot_spawn
 
-    if coords is None:
-        while True:
-            xz = input("Failed to extract coordinates from screenshot (was F3 shown?). Please enter x,z of targeted block (chest position).")
-            if xz.count(',') == 1:
-                x,z = xz.split(',')
-                if x.isdecimal() and z.isdecimal:
-                    x,z = int(x),int(z)
-                    break
-    else:
-        x,y,z = coords
-
-    assert len(possible_tables) >= 1
-    if len(possible_tables) > 1:
-        while True:
-            tidx = input("Please select the structure type:\n" + '\n'.join(f'  [{i+1}] {t}' for i,t in enumerate(possible_tables)) + '\nEnter number:')
-            if tidx.isdecimal() and 1 <= int(tidx) <= len(possible_tables):
-                table = possible_tables[int(tidx)-1]
-                break
-    else:
-        table = possible_tables[0]
+    loot = {}
+    for item,qty in loot_container:
+        if item is None: continue
+        loot[item] = qty + loot.get(item, 0)
 
     step,index,feat_seed_salt,_,enum_idx,_ = salts[table]
     shuffle_order = 0
-    for i in range(27): shuffle_order |= ((contents[i][0] is not None) << i)
+    for i in range(27): shuffle_order |= ((loot_container[i][0] is not None) << i)
     loottable,lookup = loottable_c(table, loot)
     targ = [0]*len(lookup)
     for item,qty in loot.items(): targ[lookup[item]] = qty
-    split_stacks = [((lookup[item] << 8) | qty) if item else 0 for item,qty in contents]
-    print(loot)
+    split_stacks = [((lookup[item] << 8) | qty) if item else 0 for item,qty in loot_container]
     ench_callcounts = get_enchant_rng_call_data_c()
+    print(f"\nCracking structure {table} loot chest with these contents:")
+    print_container(loot_container)
+
+    return (shuffle_order,
+            np.array(loottable, dtype=np.uint8),
+            np.array(targ, dtype=np.uint8),
+            len(lookup),
+            np.array([x, z, step, index], dtype=np.int32),
+            feat_seed_base,
+            np.array(spawn_checks, dtype=np.int64),
+            len(spawn_checks),
+            np.array(split_stacks, dtype=np.uint16),
+            np.array(ench_callcounts, dtype=np.uint64))
+
+def run(ss_dir, ss_count):
+    if os.path.isdir(ss_dir):
+        if not ss_dir.endswith('/'): ss_dir += '/'
+        file, spawn_checks = get_info(ss_dir, ss_count)
+        coords, contents, possible_tables = process_image(ss_dir + file, prompt_uncertain=True)
+    #    possible_tables = [table for table in possible_tables if sum(entropy(table)) < float('inf')] TODO replace (fast H calc)
+
+        if coords is None:
+            while True:
+                xz = input("Failed to extract coordinates from screenshot (was F3 shown?). Please enter x,z of targeted block (chest position).")
+                if xz.count(',') == 1:
+                    x,z = xz.split(',')
+                    if x.isdecimal() and z.isdecimal:
+                        x,z = int(x),int(z)
+                        break
+        else:
+            x,y,z = coords
+
+        assert len(possible_tables) >= 1
+        if len(possible_tables) > 1:
+            while True:
+                tidx = input("Please select the structure type:\n" + '\n'.join(f'  [{i+1}] {t}' for i,t in enumerate(possible_tables)) + '\nEnter number:')
+                if tidx.isdecimal() and 1 <= int(tidx) <= len(possible_tables):
+                    table = possible_tables[int(tidx)-1]
+                    break
+        else:
+            table = possible_tables[0]
+
+        os.makedirs('run_history', exist_ok=True)
+        with open(f'run_history/{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.txt', 'w') as f:
+            for scx,scz,sctable in spawn_checks:
+                f.write(f'{scx}\t{scz}\t{sctable}\n')
+            for row in range(3):
+                f.write('\n')
+                for item,qty in contents[row*9:row*9+9]:
+                    if item is None:
+                        f.write('-\n')
+                    else:
+                        f.write(f'{item.replace("minecraft:","")}\t{qty}\n')
+            f.write(f'{x}\t{z}\t{table}\n')
+    else:
+        spawn_checks = []
+        contents = []
+        with open(ss_dir) as f:
+            for line_ in f:
+                if line_ == '\n': break
+                line = line_.strip().split()
+                if len(line) == 3 and re.fullmatch(r'\-?\d+', line[0]) and re.fullmatch(r'\-?\d+', line[1]) and line[2].lower() in salts:
+                    spawn_checks.append([int(line[0]), int(line[1]), line[2].lower()])
+                else:
+                    print(f"Skipping line '{line_.strip()}', does not match format 'x z structure'.")
+            line_ = f.readline().strip()
+            line = line_.split()
+            if len(line) == 3 and re.fullmatch(r'\-?\d+', line[0]) and re.fullmatch(r'\-?\d+', line[1]) and line[2].lower() in salts:
+                x,z,table = int(line[0]), int(line[1]), line[2].lower()
+            else:
+                print(f"Skipping line '{line_}' - does not match format 'x z structure'.")
+            for row in range(3):
+                for col in range(9):
+                    line_ = f.readline().strip()
+                    line = line_.split()
+                    if len(line) == 2 and re.fullmatch(r'\d+', line[1]):
+                        contents.append(['minecraft:' + line[0].lower(), int(line[1])]) # TODO check item valid
+                    else:
+                        contents.append([None, 0])
+                
+
+
+    cuda_data = process_info_for_cuda(spawn_checks, contents, [table, x, z])
 
     lib = ctypes.CDLL("./crack.so")
     lib.dispatch.restype = None
@@ -179,16 +260,7 @@ def run(ss_dir, ss_count):
 
     def dispatch():
         lib.dispatch(
-            shuffle_order,
-            np.array(loottable, dtype=np.uint8),
-            np.array(targ, dtype=np.uint8),
-            len(lookup),
-            np.array([x, z, step, index], dtype=np.int32),
-            feat_seed_base,
-            np.array(spawn_checks, dtype=np.int64),
-            len(spawn_checks),
-            np.array(split_stacks, dtype=np.uint16),
-            np.array(ench_callcounts, dtype=np.uint64)
+            *cuda_data
         )
 
     p = Process(target=dispatch)
