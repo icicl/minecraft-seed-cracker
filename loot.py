@@ -156,9 +156,6 @@ def process_loot_pool(pool, rng):
             function = entry['functions'][0]['function']
             if function == 'minecraft:enchant_randomly':
                 enchant,max_level = get_random_enchant(entry['name'], rng)
-#                print(enchantments)
-#                idx = rng.next_int(len(enchantments))
-#                enchant,max_level = enchantments[idx]
                 level = r_int(rng, 1, max_level)
                 print(enchant, level)
                 qty = 1

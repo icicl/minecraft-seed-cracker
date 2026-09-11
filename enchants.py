@@ -113,22 +113,3 @@ def get_random_enchant(item_id, rng):
     return enchant,ENCHANT_LEVELS[enchant]
 
 
-
-def get_valid_enchants_(item_id):
-    cats = {"BREAKABLE"} # Everything with durability can have Unbreaking/Mending
-    
-    if "book" in item_id: return "ALL" # Books ignore categories
-    
-    if "helmet" in item_id: cats.update(["ARMOR", "ARMOR_HEAD", "WEARABLE"])
-    elif "chestplate" in item_id: cats.update(["ARMOR", "ARMOR_CHEST", "WEARABLE"])
-    elif "leggings" in item_id: cats.update(["ARMOR", "WEARABLE"])
-    elif "boots" in item_id: cats.update(["ARMOR", "ARMOR_FEET", "WEARABLE"])
-    elif "sword" in item_id: cats.add("WEAPON")
-    elif "axe" in item_id: cats.update(["DIGGER", "WEAPON"]) # Axes are both!
-    elif "pickaxe" in item_id or "shovel" in item_id or "hoe" in item_id: cats.add("DIGGER")
-    elif "bow" in item_id: cats.add("BOW")
-    elif "crossbow" in item_id: cats.add("CROSSBOW")
-    elif "fishing_rod" in item_id: cats.add("FISHING_ROD")
-    elif "trident" in item_id: cats.update(["TRIDENT", "WEAPON"]) # Impaling/Loyalty etc
-
-    return [ench for ench in ALL_ENCHANTS if ENCHANT_DATA[ench][1] in cats]

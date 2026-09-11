@@ -96,78 +96,79 @@ __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
     int64_t* fifo_addr = fifo + tx*FIFODEPTH;
     uint8_t fifo_start = 0, fifo_end = 0, fifo_size = 0;
 
-    uint8_t anyfull = 0;
     while (dseed < num_seeds || __any_sync(0xFFFFFFFF, fifo_size > 0)) {
-        while (dseed < num_seeds) {
-            if (__any_sync(0xFFFFFFFF, fifo_size == FIFODEPTH)) break;
-
-            int64_t seed = seed_start + dseed;
-            if (can_spawn_desert_pyramid(seed + structure_salt, mcx, mcz)) {
-                fifo_addr[fifo_end % FIFODEPTH] = seed;
-                fifo_end++;
-                fifo_size++;
+        for (int i=0; i<4; i++) { // avoid excessive __*sync() calls
+            if (dseed < num_seeds && fifo_size < FIFODEPTH) {
+                int64_t seed = seed_start + dseed;
+                if (can_spawn_desert_pyramid(seed + structure_salt, mcx, mcz)) {
+                    fifo_addr[fifo_end % FIFODEPTH] = seed;
+                    fifo_end++;
+                    fifo_size++;
+                }
+                dseed += stride;
             }
-            dseed += stride;
         }
+        if (!__any_sync(0xFFFFFFFF, fifo_size == FIFODEPTH)) continue;
         if (fifo_size == 0) continue;
         int64_t seed = fifo_addr[fifo_start%FIFODEPTH];
         int64_t wseed = seed;
         fifo_start++;
         fifo_size--;
         
+        for (int calls=0; calls<4; calls++) { // DES TEMPLE TODO parameterize (use x/z to get call#)
+            int64_t feat_seed = get_lcg_feature_seed(seed, x, z, 3, 4, calls) & LCG_MSK;
+            seed = feat_seed ^ LCG_MUL;
 
-        int64_t feat_seed = get_lcg_feature_seed(seed, x, z, 3, 4, 0) & LCG_MSK;
-        seed = feat_seed ^ LCG_MUL;
-
-        for (int i=1;i<distinct_items; i++) loot[i] = s_target[i];
-        loot[0] = INT8_MAX; // don't want to break if 'empty' (id=0) rolled
-        uint32_t* table_idx = s_table; // aligned to 4-bytes:    [num_pools | pad | pad | pad] { [rmin | rmax | totweight(2-byte) ] { [item_id | qmin | qmax | ench] } }
-        int num_pools = table_idx[0] & 0xFF;
-        table_idx += 1;
-        int match = 1;
-        for (int pool_idx=0; (pool_idx<num_pools)&&match; pool_idx++) {
-            uint32_t pool_stats = table_idx[0];
-            int rmin = pool_stats & 0xFF, rmax = (pool_stats >> 8) & 0xFF;
-            int tot_weight = pool_stats >> 16;
+            for (int i=1;i<distinct_items; i++) loot[i] = s_target[i];
+            loot[0] = INT8_MAX; // don't want to break if 'empty' (id=0) rolled
+            uint32_t* table_idx = s_table; // aligned to 4-bytes:    [num_pools | pad | pad | pad] { [rmin | rmax | totweight(2-byte) ] { [item_id | qmin | qmax | ench] } }
+            int num_pools = table_idx[0] & 0xFF;
             table_idx += 1;
-            int num_rolls = next_int_util(seed, rmin, rmax);
-            for (int roll_num=0; roll_num<num_rolls; roll_num++) {
-                int ent_idx = next_int_util(seed, 1, tot_weight)-1;
-                uint32_t entry_stats = table_idx[ent_idx];
-                int qmin = (entry_stats >> 8) & 0xFF, qmax = (entry_stats >> 16) & 0xFF, ench = (entry_stats >> 24);
-                if (ench) {
-                    int ench_idx = next_int(seed, 37);
-                    if ((ENCH_PACKED >> ench_idx) & 1) next_int(seed, 1); // ignore result (already have enough info w/o it)
+            int match = 1;
+            for (int pool_idx=0; (pool_idx<num_pools)&&match; pool_idx++) {
+                uint32_t pool_stats = table_idx[0];
+                int rmin = pool_stats & 0xFF, rmax = (pool_stats >> 8) & 0xFF;
+                int tot_weight = pool_stats >> 16;
+                table_idx += 1;
+                int num_rolls = next_int_util(seed, rmin, rmax);
+                for (int roll_num=0; roll_num<num_rolls; roll_num++) {
+                    int ent_idx = next_int_util(seed, 1, tot_weight)-1;
+                    uint32_t entry_stats = table_idx[ent_idx];
+                    int qmin = (entry_stats >> 8) & 0xFF, qmax = (entry_stats >> 16) & 0xFF, ench = (entry_stats >> 24);
+                    if (ench) {
+                        int ench_idx = next_int(seed, 37);
+                        if ((ENCH_PACKED >> ench_idx) & 1) next_int(seed, 1); // ignore result (already have enough info w/o it)
+                    }
+                    int qty = next_int_util(seed, qmin, qmax);
+                    if ((loot[entry_stats & 0xFF] -= qty) < 0) {
+                        match = 0;
+                        break;
+                    };
                 }
-                int qty = next_int_util(seed, qmin, qmax);
-                if ((loot[entry_stats & 0xFF] -= qty) < 0) {
-                    match = 0;
-                    break;
-                };
+                table_idx += tot_weight;
             }
-            table_idx += tot_weight;
-        }
-        for (int i=1; (i<distinct_items)&&match; i++) { // start at 1 (ignore empty)
-            if (loot[i] != 0) match = 0;
-        }
+            for (int i=1; (i<distinct_items)&&match; i++) { // start at 1 (ignore empty)
+                if (loot[i] != 0) match = 0;
+            }
 
-        if (match) {
-            atomicAdd(&d_match_count, 1);
-            uint8_t ind[27];
-            for (int i=0; i<27; i++) ind[i] = i;
-            for (int i=27; i>1; i--) {
-                int j = next_int(seed, i);
-                uint8_t tmp = ind[j];
-                ind[j] = ind[i-1];
-                ind[i-1] = tmp;
-            }
-            int8_t correct = 1;
-            for (int i=27-d_popcnt; i<27; i++) {
-                if (((d_shuffle_order >> ind[i]) & 1) == 0) correct = 0;
-            }
-            if (correct) {
-                printf("%ld\n", wseed);
-                atomicAdd(&d_correct_count, 1);
+            if (match) {
+                atomicAdd(&d_match_count, 1);
+                uint8_t ind[27];
+                for (int i=0; i<27; i++) ind[i] = i;
+                for (int i=27; i>1; i--) {
+                    int j = next_int(seed, i);
+                    uint8_t tmp = ind[j];
+                    ind[j] = ind[i-1];
+                    ind[i-1] = tmp;
+                }
+                int8_t correct = 1;
+                for (int i=27-d_popcnt; i<27; i++) {
+                    if (((d_shuffle_order >> ind[i]) & 1) == 0) correct = 0;
+                }
+                if (correct) {
+                    printf("%ld\n", wseed);
+                    atomicAdd(&d_correct_count, 1);
+                }
             }
         }
     }

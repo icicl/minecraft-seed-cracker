@@ -1,0 +1,27 @@
+enchant with int exp_level, from applicable_enchantments
+
+exp_level += 1
+exp_level += rng.nextInt(enchantability.value() / 4 + 1) 
+exp_level += rng.nextInt(enchantability.value() / 4 + 1);
+
+float offset = (rng.nextFloat() + rng.nextFloat() - 1.0F) * 0.15F;
+exp_level = Mth.clamp(
+   Math.round((float)exp_level + (float)exp_level * offset),
+   1, Integer.MAX_VALUE);
+
+applicable_enchantments = [filter by item and modified level]
+if applicable_enchantments
+   weighted random pick
+   while(rng.nextInt(50) <= exp_level) {
+      filter out incompatible, break if empty
+      weighted random pull
+      exp_level /= 2
+
+    Every enchantment conflicts with itself.
+    All damage enchantments (Sharpness, Smite, and Bane of Arthropods) conflict with each other.
+    All protection enchantments (Protection, Blast Protection, Fire Protection, Projectile Protection) conflict with each other.
+    Silk Touch conflicts with Fortune, Looting, and Luck of the Sea.
+    Depth Strider and Frost Walker conflict with each other.
+    Mending and Infinity conflict with each other.
+    Riptide conflicts with Loyalty and Channeling.
+    Multishot and Piercing conflict with each other.
