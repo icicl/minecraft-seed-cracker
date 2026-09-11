@@ -68,6 +68,8 @@ __device__ int64_t get_lcg_feature_seed(int64_t world_seed, int32_t x, int32_t z
     return next_long(feature_seed); 
 }
 
+#define FIFODEPTH 1
+#define BLOCKSIZE 256
 
 template<uint8_t distinct_items>
 __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
@@ -77,6 +79,7 @@ __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
     for (int i=threadIdx.x; i<distinct_items; i+=blockDim.x) s_target[i] = d_target[i];
     __syncthreads();
     int txg = blockIdx.x * blockDim.x + threadIdx.x;
+    int tx = threadIdx.x;
     int stride = blockDim.x * gridDim.x;
     int8_t loot[distinct_items];
 
@@ -87,12 +90,32 @@ __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
         int32_t rx = cx / spacing, rz = cz / spacing;
         int64_t structure_salt = (rx*341873128712 + rz*132897987541 + salt);
 
-    for (uint64_t dseed=txg; dseed<num_seeds; dseed+=stride) {
+    uint64_t dseed = txg;
 
-        int64_t seed = seed_start+dseed;
+    __shared__ int64_t fifo[BLOCKSIZE*FIFODEPTH];
+    int64_t* fifo_addr = fifo + tx*FIFODEPTH;
+    uint8_t fifo_start = 0, fifo_end = 0, fifo_size = 0;
 
-        // TODO: fifo valid seeds for spawn OK
-        if (!can_spawn_desert_pyramid(seed + structure_salt, mcx, mcz)) continue;
+    uint8_t anyfull = 0;
+    while (dseed < num_seeds || __any_sync(0xFFFFFFFF, fifo_size > 0)) {
+        while (dseed < num_seeds) {
+            if (__any_sync(0xFFFFFFFF, fifo_size == FIFODEPTH)) break;
+
+            int64_t seed = seed_start + dseed;
+            if (can_spawn_desert_pyramid(seed + structure_salt, mcx, mcz)) {
+                fifo_addr[fifo_end % FIFODEPTH] = seed;
+                fifo_end++;
+                fifo_size++;
+            }
+            dseed += stride;
+        }
+        if (fifo_size == 0) continue;
+        int64_t seed = fifo_addr[fifo_start%FIFODEPTH];
+        int64_t wseed = seed;
+        fifo_start++;
+        fifo_size--;
+        
+
         int64_t feat_seed = get_lcg_feature_seed(seed, x, z, 3, 4, 0) & LCG_MSK;
         seed = feat_seed ^ LCG_MUL;
 
@@ -143,7 +166,7 @@ __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
                 if (((d_shuffle_order >> ind[i]) & 1) == 0) correct = 0;
             }
             if (correct) {
-                printf("%ld\n", seed_start+dseed);
+                printf("%ld\n", wseed);
                 atomicAdd(&d_correct_count, 1);
             }
         }
@@ -175,8 +198,8 @@ void gpu_init(int64_t seed) {
     cudaMemset(&d_correct_count, 0, sizeof(uint32_t));
 
     printf("Launching kernel...\n");
-    const uint64_t NUM_SEEDS_TO_CHECK = 1L << 40;
-    #define CASE(n) case n: check_loot_collision<n><<<1024, 256>>>(seed, NUM_SEEDS_TO_CHECK); break;
+    const uint64_t NUM_SEEDS_TO_CHECK = 1L << 36;
+    #define CASE(n) case n: check_loot_collision<n><<<1024, BLOCKSIZE>>>(seed, NUM_SEEDS_TO_CHECK); break;
     switch (h_distinct_items) {
         CASE(2);
         CASE(3);
