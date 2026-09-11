@@ -1,4 +1,5 @@
 from extract import get_chest_loot_table
+from enchants import get_enchantable_item_id
 
 def loottable_c(table_name, loot_item_counts):
     lookup = {'minecraft:empty':0, 'miss':1}
@@ -24,14 +25,13 @@ def loottable_c(table_name, loot_item_counts):
         output.append(tot_weight&0xFF)
         output.append(tot_weight>>8)
         for entry in entries:
-            ## TODO: account for enchantment filtering
             name = 'minecraft:empty' if entry['type'] == 'minecraft:empty' else (entry['name'] if entry['name'] in loot_item_counts else 'miss')
             if name not in lookup: lookup[name] = len(lookup)
             item_id = lookup[name]
             if 'functions' in entry:
                 assert len(entry['functions']) == 1
                 if entry['functions'][0]['function'] == 'minecraft:enchant_randomly':
-                    entry_stats = [item_id, 1, 1, 1]
+                    entry_stats = [item_id, 1, 1, get_enchantable_item_id(entry['name'])] # iten, qmin, qmax, specialfunc id
                 elif entry['functions'][0]['function'] == 'minecraft:set_count':
                     assert entry['functions'][0]['count']['type'] == 'minecraft:uniform'
                     qmin = entry['functions'][0]['count']['min']

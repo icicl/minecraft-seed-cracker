@@ -1,4 +1,3 @@
-####### ICON3D #######
 import numpy as np
 from PIL import Image
 from functools import cache

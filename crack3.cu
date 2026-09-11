@@ -1,15 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
-#include <cuda_runtime.h>
-
 #include <sys/time.h>
-
-uint64_t time_us() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    uint64_t micros = (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
-    return micros;
-}
+#include <cuda_runtime.h>
 
 enum structures {
     DESERT_TEMPLE,
@@ -26,8 +18,32 @@ enum structures {
 #define MAX_DISTINCT_ITEMS 16
 #define MAX_LOOT_TABLE_SIZE 2048
 #define MAX_SPAWN_CHECKS 8
-#define ENCH_PACKED 0b11001111100111101111111101110111111L // which enchantments need a second call
+#define MAX_DISTINCT_ENCHANTABLE_TOOLS 80
 
+
+uint64_t time_us() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t micros = (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+    return micros;
+}
+
+
+__constant__ uint8_t d_table[MAX_LOOT_TABLE_SIZE];
+__constant__ uint8_t d_target[MAX_DISTINCT_ITEMS];
+__constant__ uint8_t d_distinct_items;
+__constant__ uint8_t d_popcnt;
+__constant__ uint32_t d_shuffle_order;
+__constant__ int32_t d_feature_seed_info[4];
+__device__ unsigned long long  d_match_counts[5];
+__constant__ int64_t  d_spawn_checks[MAX_SPAWN_CHECKS];
+__constant__ uint8_t d_num_spawn_checks;
+__constant__ int64_t d_prng_first_call_salt;
+__constant__ uint16_t d_split_stacks[27];
+__constant__ uint64_t d_enchant_callcounts[MAX_DISTINCT_ENCHANTABLE_TOOLS];
+
+
+/* PRNG LOGIC */
 __device__ int64_t next(int64_t& seed, int bits) {
     seed = (seed * LCG_MUL + LCG_ADD) & LCG_MSK;
     return seed >> (48 - bits);
@@ -54,37 +70,16 @@ __device__ int64_t next_long(int64_t& seed) {
     return ((int64_t)next(seed, 32) << 32) + (int64_t)(int32_t)next(seed, 32);
 }
 
-__constant__ uint8_t d_table[MAX_LOOT_TABLE_SIZE]; // Adjust size to match your maximum table byte-size
-__constant__ uint8_t d_target[MAX_DISTINCT_ITEMS];
-__constant__ uint8_t d_distinct_items;
-__constant__ uint8_t d_popcnt;
-__constant__ uint32_t d_shuffle_order;
-__constant__ int32_t d_feature_seed_info[4];
-__device__ unsigned long long  d_match_counts[5];
-__constant__ int64_t  d_spawn_checks[MAX_SPAWN_CHECKS];
-__constant__ uint8_t d_num_spawn_checks;
-__constant__ int64_t d_prng_first_call_salt;
-__constant__ uint16_t d_split_stacks[27];
-
-uint8_t* h_table;
-uint8_t* h_target;
-uint8_t  h_distinct_items;
-uint8_t  h_popcnt;
-uint32_t h_shuffle_order;
-int32_t* h_feature_seed_info;
-int64_t* h_spawn_checks;
-uint8_t h_num_spawn_checks;
-uint64_t h_prng_first_call_salt;
-uint64_t h_match_counts[5];
-uint16_t* h_split_stacks;
-
 __device__ int64_t reverse_prng_call(int64_t rng_out, int64_t packed_info) {
     int64_t prev = (rng_out * 0xdfe05bcb1365 + 0x615c0e462aa9);
     prev ^= LCG_MUL;
     prev -= packed_info;
     return prev & LCG_MSK;
 }
+/* END PRNG FUNCTIONS */
 
+
+/* WORLD GEN FUNCTIONS */
 __device__ uint8_t can_spawn_grid_based(int64_t seed_with_salt, int32_t mcx, int32_t mcz, uint8_t modulus) {
     int64_t seed = (seed_with_salt ^ LCG_MUL) & LCG_MSK;
     return next_int(seed, modulus) == mcx && next_int(seed, modulus) == mcz;
@@ -111,7 +106,6 @@ __device__ uint8_t spawn_check(int64_t wseed, int64_t packed_info) {
     return 0;
 }
 
-
 __device__ int64_t get_lcg_feature_seed(int64_t world_seed, int32_t x, int32_t z, int index, int step, int calls) {
     x = x & 0xFFFFFFF0;
     z = z & 0xFFFFFFF0;
@@ -124,6 +118,7 @@ __device__ int64_t get_lcg_feature_seed(int64_t world_seed, int32_t x, int32_t z
     for (int _=0; _<calls; _++) next_long(feature_seed);
     return next_long(feature_seed); 
 }
+/* END WORLD GEN FUNCTIONS */
 
 
 __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_idx) {
@@ -149,7 +144,6 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
 
     int64_t seed, wseed;
 
-    // Buried treasure
     int64_t inner_lb, inner_ub, inner_stride;
     int64_t outer_lb, outer_ub, outer_stride;
 
@@ -202,8 +196,10 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
                             uint32_t entry_stats = table_idx[ent_idx]; // table is a LUT - each possible chosen cum. weight has an entry for the corresponding item. This info is calculated in the invoking python
                             int qmin = (entry_stats >> 8) & 0xFF, qmax = (entry_stats >> 16) & 0xFF, ench = (entry_stats >> 24);
                             if (ench) { // TODO -- acount for tool/armor filtering
-                                int ench_idx = next_int(seed, 37);
-                                if ((ENCH_PACKED >> ench_idx) & 1) next_int(seed, 1); // ignore result (already have enough info w/o it)
+                                uint64_t ench_call_info = d_enchant_callcounts[ench];
+                                uint8_t valid_num_tools = ench_call_info >> 56;
+                                int ench_idx = next_int(seed, valid_num_tools);
+                                if ((ench_call_info >> ench_idx) & 1) next_int(seed, 1); // ignore result (already have enough info w/o it)
                             }
                             int qty = next_int_util(seed, qmin, qmax);
                             if ((loot[entry_stats & 0xFF] -= qty) < 0) {
@@ -279,49 +275,8 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
     atomicAdd(d_match_counts+1, spawn_ok_count);
 }
 
-void gpu_init() {
-    printf("Copying data to GPU...\n");
-    cudaMemcpyToSymbol(d_table, h_table, MAX_LOOT_TABLE_SIZE*sizeof(uint8_t));
-    cudaMemcpyToSymbol(d_target, h_target, MAX_DISTINCT_ITEMS*sizeof(uint8_t));
-    cudaMemcpyToSymbol(d_distinct_items, &h_distinct_items, sizeof(uint8_t));
-    cudaMemcpyToSymbol(d_popcnt, &h_popcnt, sizeof(uint8_t));
-    cudaMemcpyToSymbol(d_shuffle_order, &h_shuffle_order, sizeof(uint32_t));
-    cudaMemcpyToSymbol(d_num_spawn_checks, &h_num_spawn_checks, sizeof(uint8_t));
-    cudaMemcpyToSymbol(d_spawn_checks, h_spawn_checks, sizeof(int64_t)*MAX_SPAWN_CHECKS);
-    cudaMemcpyToSymbol(d_feature_seed_info, h_feature_seed_info, 4*sizeof(int32_t));
-    cudaMemcpyToSymbol(d_prng_first_call_salt, &h_prng_first_call_salt, sizeof(uint64_t));
-    cudaMemset(&d_match_counts, 0, 5*sizeof(unsigned long long));
-    cudaMemcpyToSymbol(d_split_stacks, h_split_stacks, 27*sizeof(uint16_t));
-
-    printf("Launching test kernel...\n");
-
-    uint64_t timer;
-    uint32_t test_kernel_size = 16384;
-    do {
-        test_kernel_size /= 2;
-        timer = -time_us();
-        check_loot_collision<<<1024, 256>>>(test_kernel_size, 0);
-        cudaDeviceSynchronize();
-        timer += time_us();
-    } while (timer < 200000);
-    printf("Test kernel finished in %.1fms\n",(float)timer / 1000);
-    printf("Estimated time to check all seeds: \e[0;35m%.1fs\e[0m\n\n", (float)timer / 1000000 * test_kernel_size);
-    printf("Launching full kernel...\n");
-    timer = -time_us();
-
-    uint16_t num_dispatches = 256;
-    for (uint16_t dispatch_idx=0; dispatch_idx<num_dispatches; dispatch_idx++) {
-        check_loot_collision<<<1024, 256>>>(num_dispatches, dispatch_idx);
-        cudaDeviceSynchronize();
-        printf("\r%4.1f%% of seeds processed. %4.1fs elapsed.", 100.0*(dispatch_idx+1)/num_dispatches, 0.000001*(time_us()+timer));
-        fflush(stdout);
-    }
 
 
-
-    cudaMemcpyFromSymbol(&h_match_counts, d_match_counts, 5*sizeof(unsigned long long*));
-    printf("Checked %lu seeds. \n%lu passed structure spawn check.\nFiltered to %lu matches using item quantities in loot.\nFurther filtered to %lu matches using the shuffle of empty slots. Reduced to %lu using the exact split+shuffle of items.\n", h_match_counts[0], h_match_counts[1], h_match_counts[2], h_match_counts[3], h_match_counts[4]);
-}
 
 //nvcc -O3 -Xcompiler -fPIC -shared crack3.cu -o crack.so
 extern "C" // preserve function name
@@ -334,7 +289,8 @@ void dispatch(
     int64_t prng_first_call_salt,
     int64_t* spawn_checks,
     int num_spawn_checks,
-    uint16_t* split_stacks
+    uint16_t* split_stacks,
+    uint64_t* enchant_callcounts
 ) {
     int popcnt = 0;
     for (int i=0; i<27; i++) popcnt += ((shuffle_order >> i)&1);
@@ -342,19 +298,50 @@ void dispatch(
         printf("ERROR - too many items in loot table. Recompile with larger MAX_DISTINCT_ITEMS.\n");
         exit(1);
     }
+    if (enchant_callcounts[0] > MAX_DISTINCT_ENCHANTABLE_TOOLS) {
+        printf("ERROR: please increase MAX_DISTINCT_ENCHANTABLE_TOOLS and recompile.");
+        exit(1);
+    }
 
     // todo: check for loot table too large
-    h_table = table;
-    h_target = target;
-    h_distinct_items = distinct_items;
-    h_popcnt = popcnt;
-    h_shuffle_order = shuffle_order;
-    h_num_spawn_checks = num_spawn_checks;
-    h_spawn_checks = spawn_checks;
-    h_feature_seed_info = feature_seed_info;
-    h_prng_first_call_salt = prng_first_call_salt;
-    h_split_stacks = split_stacks;
+    printf("Copying data to GPU...\n");
+    cudaMemcpyToSymbol(d_table, table, MAX_LOOT_TABLE_SIZE*sizeof(uint8_t));
+    cudaMemcpyToSymbol(d_target, target, MAX_DISTINCT_ITEMS*sizeof(uint8_t));
+    cudaMemcpyToSymbol(d_distinct_items, &distinct_items, sizeof(uint8_t));
+    cudaMemcpyToSymbol(d_popcnt, &popcnt, sizeof(uint8_t));
+    cudaMemcpyToSymbol(d_shuffle_order, &shuffle_order, sizeof(uint32_t));
+    cudaMemcpyToSymbol(d_num_spawn_checks, &num_spawn_checks, sizeof(uint8_t));
+    cudaMemcpyToSymbol(d_spawn_checks, spawn_checks, sizeof(int64_t)*MAX_SPAWN_CHECKS);
+    cudaMemcpyToSymbol(d_feature_seed_info, feature_seed_info, 4*sizeof(int32_t));
+    cudaMemcpyToSymbol(d_prng_first_call_salt, &prng_first_call_salt, sizeof(uint64_t));
+    cudaMemset(&d_match_counts, 0, 5*sizeof(unsigned long long));
+    cudaMemcpyToSymbol(d_split_stacks, split_stacks, 27*sizeof(uint16_t));
+    cudaMemcpyToSymbol(d_enchant_callcounts, enchant_callcounts, MAX_DISTINCT_ENCHANTABLE_TOOLS*sizeof(uint64_t));
 
+    uint64_t timer;
+    uint32_t test_kernel_size = 16384;
+    printf("Launching test kernel...\n");
+    do {
+        test_kernel_size /= 2;
+        timer = -time_us();
+        check_loot_collision<<<1024, 256>>>(test_kernel_size, 0);
+        cudaDeviceSynchronize();
+        timer += time_us();
+    } while (timer < 200000);
 
-    gpu_init();
+    printf("Test kernel finished in %.1fms\n",(float)timer / 1000);
+    printf("Estimated time to check all seeds: \e[0;35m%.1fs\e[0m\n\n", (float)timer / 1000000 * test_kernel_size);
+
+    printf("Launching full kernel...\n");
+    timer = -time_us();
+    uint16_t num_dispatches = 256;
+    for (uint16_t dispatch_idx=0; dispatch_idx<num_dispatches; dispatch_idx++) {
+        check_loot_collision<<<1024, 256>>>(num_dispatches, dispatch_idx);
+        cudaDeviceSynchronize();
+        printf("\r%4.1f%% of seeds processed. %4.1fs elapsed.", 100.0*(dispatch_idx+1)/num_dispatches, 0.000001*(time_us()+timer));
+        fflush(stdout);
+    }
+    uint64_t h_match_counts[5];
+    cudaMemcpyFromSymbol(&h_match_counts, d_match_counts, 5*sizeof(unsigned long long*));
+    printf("Checked %lu seeds. \n%lu passed structure spawn check.\nFiltered to %lu matches using item quantities in loot.\nFurther filtered to %lu matches using the shuffle of empty slots. Reduced to %lu using the exact split+shuffle of items.\n", h_match_counts[0], h_match_counts[1], h_match_counts[2], h_match_counts[3], h_match_counts[4]);
 }

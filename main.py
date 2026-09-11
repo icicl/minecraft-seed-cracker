@@ -5,6 +5,7 @@ from multiprocessing import Process
 from process_image import process_image
 from loot import loottable_c
 from entropy_calc import entropy
+from enchants import get_enchant_rng_call_data_c
 
 
 salts = { # step, index, feat seed, grid-based spacing, enum index, spawn check type
@@ -147,19 +148,7 @@ def run(ss_dir, ss_count):
     for item,qty in loot.items(): targ[lookup[item]] = qty
     split_stacks = [((lookup[item] << 8) | qty) if item else 0 for item,qty in contents]
     print(loot)
-
-    print_c_code = False
-    if print_c_code:
-        print(f"Loot items give {h1:.1f} bits of information, and the positions of occupied chest slots gives {h2:.1f}. Have estimated {h3:.1f} spawn bits, and {h4:.1f} PRNG reversal bits.")
-        print(f"Total: {h1+h2:.1f} bits of ~48 needed for unique determination.\n")
-        print(f"uint32_t shuffle_order = 0b{bin(shuffle_order)[2:].zfill(27)};")
-        print(f"uint8_t table[{len(loottable)}] = {'{'}{str(loottable)[1:-1]}{'}'};")
-        print(f"uint8_t target[{len(targ)}] = {'{'}{str(targ)[1:-1]}{'}'};")
-        print(f"int distinct_items = {len(lookup)};")
-        print(f"int32_t feature_seed_info[4] = {'{'}{x}, {z}, {step}, {index}{'}'}; // x, z, index, step")
-        print(f"int64_t prng_first_call_salt = {feat_seed_base}LL;")
-        print(f'int64_t spawns_checks[{len(spawn_checks)}] = {'{'}{str(spawn_checks)[1:-1]}{'}'};')
-        print(f"int num_spawn_checks = {len(spawn_checks)};")
+    ench_callcounts = get_enchant_rng_call_data_c()
 
     lib = ctypes.CDLL("./crack.so")
     lib.dispatch.restype = None
@@ -173,6 +162,7 @@ def run(ss_dir, ss_count):
         np.ctypeslib.ndpointer(dtype=np.int64, flags="C_CONTIGUOUS"),
         ctypes.c_int,
         np.ctypeslib.ndpointer(dtype=np.uint16, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.uint64, flags="C_CONTIGUOUS"),
     ]
 
     def dispatch():
@@ -185,7 +175,8 @@ def run(ss_dir, ss_count):
             feat_seed_base,
             np.array(spawn_checks, dtype=np.int64),
             len(spawn_checks),
-            np.array(split_stacks, dtype=np.uint16)
+            np.array(split_stacks, dtype=np.uint16),
+            np.array(ench_callcounts, dtype=np.uint64)
         )
 
     p = Process(target=dispatch)
@@ -199,10 +190,6 @@ def run(ss_dir, ss_count):
         p.join()
     return True
 
-#run('./ss/', 20)
-
-#ss = '/home/icicl/.minecraft/screenshots/'
-#ss = "./ss/"
 
 def main():
     if len(sys.argv) == 1 or sys.argv[1] == "-":
@@ -221,6 +208,7 @@ def main():
         print("Did not detect default minecraft folder.\nRun again with your screenshot directory as the first argument. Ex. 'python main.py ~/mc_screenshots/'")
         return
     run(path,20)
+
 
 if __name__ == "__main__":
     main()

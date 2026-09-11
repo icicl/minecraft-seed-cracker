@@ -22,10 +22,11 @@ def get_range(obj, require_explicit_uniform=True):
 
 ####### Functions #######
 # 1: enchant_randomly - randomly pick enchant from all enchants (filtered to item type), then pick level (if applicable).
-# 2: enchant_randomly - randomly pick enchant from the specified list of enchants, then pick level if applicable
+# 2: enchant_levels - randomly pick enchant from the specified list of enchants, then pick level if applicable
 # 3: set_damage - [presumably] pick random float f, lerp to range
-# 4: exploration_map - buried treasure map
-# 5: set_stew_effect - pick element from list, then set duration
+# 4: map - exploration map
+# 5: stew - pick element from list, then set duration
+# 6 enchant_filtered - an enchant is specified in the table
 def load_table(table):
     out = []
     check_keys(table, ['type', 'pools'])
