@@ -2,7 +2,6 @@ import os
 from PIL import Image
 from extract import get_chest_loot_table, get_texture, is_item
 import zipfile
-from loottable import load_table
 import re
 from extract import load_all_tables, load_atlas
 import numpy as np
@@ -86,8 +85,8 @@ def process_image(path):
     for table in tables.values():
         for _,entries in table:
             for entry in entries:
-                if entry[0]:
-                    name = entry[0][0]
+                name = entry[0][0]
+                if name is not None:
                     all_items.add(name)
     all_items = sorted(all_items)
 
@@ -132,7 +131,7 @@ def process_image(path):
         t_items = set()
         for _,entries in table:
             for entry in entries:
-                if entry[0]: t_items.add(entry[0][0])
+                if entry[0][0]: t_items.add(entry[0][0])
         if all(item in t_items for item in distinct_content_items):
             possible_tables.append(tname)
     print(f"The detected loot can generate in the following structures: {possible_tables}.")

@@ -91,7 +91,6 @@ __device__ uint8_t spawn_check(int64_t wseed, int64_t packed_info) {
             if (!can_spawn_desert_pyramid(wseed + packed_info, mx, mz)) return 0;
             break;
         case BURIED_TREASURE:
-//            if (wseed == 777) printf("%ld\n",packed_info);
             if (!can_spawn_buried_treasure(wseed + packed_info)) return 0;
             break;
     }
@@ -112,74 +111,69 @@ __device__ int64_t get_lcg_feature_seed(int64_t world_seed, int32_t x, int32_t z
     return next_long(feature_seed); 
 }
 
-#define STACKDEPTH 8
-#define BLOCKSIZE 256
 
-template<uint8_t distinct_items>
-__global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
-    __shared__ uint32_t s_table[MAX_LOOT_TABLE_SIZE];
-    for (int i=threadIdx.x; i<MAX_LOOT_TABLE_SIZE/4; i+=blockDim.x) s_table[i] = ((uint32_t*)d_table)[i];
-    __shared__ uint8_t s_target[distinct_items];
-    for (int i=threadIdx.x; i<distinct_items; i+=blockDim.x) s_target[i] = d_target[i];
-    __shared__ int64_t s_spawn_checks[MAX_SPAWN_CHECKS];
-    for (int i=threadIdx.x; i<MAX_SPAWN_CHECKS; i+=blockDim.x) s_spawn_checks[i] = d_spawn_checks[4*i+3];
-    __syncthreads();
-    int txg = blockIdx.x * blockDim.x + threadIdx.x;
-    int tx = threadIdx.x;
+__global__ void check_loot_collision() {
+    int tx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    int8_t loot[distinct_items];
+/*
+    int64_t aa = 7577095897946LL;
+    for (int64_t u = 17+24*tx; u < (1LL << 31); u += 24*stride) {
+        for (int64_t l = 0; l < (1LL << 17); l += 1) {
+            int64_t rout = (u << 17) | l;
+            int64_t prev = (rout * 0xdfe05bcb1365 + 0x615c0e462aa9) & LCG_MSK;
+            prev ^= LCG_MUL;
+            prev -= aa;
+            prev &= LCG_MSK;
+            if (prev < 1000 && prev >= 500) printf("%ld\n", prev);
+        }
+    }
+    return;
+*/
+
+    __shared__ uint32_t s_table[MAX_LOOT_TABLE_SIZE/4];
+    __shared__ uint8_t s_target[MAX_DISTINCT_ITEMS];
+    __shared__ int64_t s_spawn_checks[MAX_SPAWN_CHECKS];
+    for (int i=threadIdx.x; i<MAX_LOOT_TABLE_SIZE/4; i+=blockDim.x) s_table[i] = ((uint32_t*)d_table)[i];
+    for (int i=threadIdx.x; i<d_distinct_items; i+=blockDim.x) s_target[i] = d_target[i];
+    for (int i=threadIdx.x; i<d_num_spawn_checks; i+=blockDim.x) s_spawn_checks[i] = d_spawn_checks[4*i+3];
+    __syncthreads();
+    int8_t loot[MAX_DISTINCT_ITEMS];
 
     const int32_t x = d_feature_seed_info[0], z = d_feature_seed_info[1], index = d_feature_seed_info[2], step = d_feature_seed_info[3];
     const uint64_t bt_reverse_float_accel = d_buried_treasure_float;
 
-    uint64_t dseed = txg;
-
-    __shared__ int64_t stack[BLOCKSIZE*STACKDEPTH];
-    uint8_t stack_ptr = 0;
-
     int64_t seed, wseed;
-    uint64_t dseed_limit = bt_reverse_float_accel == 0 ? ((uint64_t)1 << 48) : FLOAT_0_01_LIM;
-    while (dseed < dseed_limit || stack_ptr > 0) {
-        for (int i=0; i<576*576 && dseed < dseed_limit; i++) {
-            
-            wseed = seed = (bt_reverse_float_accel == 0 ? dseed : get_wseed_from_btfloat(dseed, bt_reverse_float_accel));
-            dseed += stride;
-            uint8_t spawn_ok = 1;
-            for (int j=0; j<d_num_spawn_checks; j++) {
-                if (!spawn_check(seed, s_spawn_checks[j])) {
-                    spawn_ok = 0;
-                    break;
-                }
-            }
-            if (spawn_ok) {
-                stack[STACKDEPTH*tx + stack_ptr] = wseed;
-                stack_ptr++;
-                if (stack_ptr == STACKDEPTH) break;
-            }
+    uint64_t dseed = tx;
+    const uint64_t dseed_limit = bt_reverse_float_accel == 0 ? ((uint64_t)1 << 48) : FLOAT_0_01_LIM;
+    while (dseed < dseed_limit ) {
+        wseed = seed = (bt_reverse_float_accel == 0 ? dseed : get_wseed_from_btfloat(dseed, bt_reverse_float_accel));
+        dseed += stride;
+        uint8_t spawn_ok = 1;
+        for (int j=0; j<d_num_spawn_checks && spawn_ok; j++) {
+            spawn_ok &= spawn_check(seed, s_spawn_checks[j]);
         }
-        if (stack_ptr == 0) continue;
-        stack_ptr--;
+        if (!spawn_ok) continue;
         
         for (int calls=0; calls<4; calls++) { // DES TEMPLE TODO parameterize (use x/z to get call#)
-            wseed = seed = stack[STACKDEPTH*tx + stack_ptr];
+            seed = wseed;
             int64_t feat_seed = get_lcg_feature_seed(seed, x, z, index, step, calls) & LCG_MSK;
             seed = feat_seed ^ LCG_MUL;
 
-            for (int i=1;i<distinct_items; i++) loot[i] = s_target[i];
+            for (int i=1;i<d_distinct_items; i++) loot[i] = s_target[i];
             loot[0] = INT8_MAX; // don't want to break if 'empty' (id=0) rolled
             uint32_t* table_idx = s_table; // aligned to 4-bytes:    [num_pools | pad | pad | pad] { [rmin | rmax | totweight(2-byte) ] { [item_id | qmin | qmax | ench] } }
             int num_pools = table_idx[0] & 0xFF;
             table_idx += 1;
             int match = 1;
-            for (int pool_idx=0; (pool_idx<num_pools)&&match; pool_idx++) {
+            int pool_idx = num_pools;
+            while ((pool_idx--) && match) {
                 uint32_t pool_stats = table_idx[0];
                 int rmin = pool_stats & 0xFF, rmax = (pool_stats >> 8) & 0xFF;
                 int tot_weight = pool_stats >> 16;
-                table_idx += 1;
                 int num_rolls = next_int_util(seed, rmin, rmax);
                 for (int roll_num=0; roll_num<num_rolls; roll_num++) {
-                    int ent_idx = next_int_util(seed, 1, tot_weight)-1;
-                    uint32_t entry_stats = table_idx[ent_idx];
+                    int ent_idx = next_int_util(seed, 1, tot_weight);
+                    uint32_t entry_stats = table_idx[ent_idx]; // table is a LUT - each possible chosen cum. weight has an entry for the corresponding item. This info is calculated in the invoking python
                     int qmin = (entry_stats >> 8) & 0xFF, qmax = (entry_stats >> 16) & 0xFF, ench = (entry_stats >> 24);
                     if (ench) {
                         int ench_idx = next_int(seed, 37);
@@ -191,9 +185,9 @@ __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
                         break;
                     };
                 }
-                table_idx += tot_weight;
+                table_idx += (1 + tot_weight); // jump ahead by 1 entry (num. roll and tot weight info), plus the tot_weight LUT entries
             }
-            for (int i=1; (i<distinct_items)&&match; i++) { // start at 1 (ignore empty)
+            for (int i=1; (i<d_distinct_items)&&match; i++) { // start at 1 (ignore minecraft:empty at index 0)
                 if (loot[i] != 0) match = 0;
             }
 
@@ -220,20 +214,6 @@ __global__ void check_loot_collision(int64_t seed_start, uint64_t num_seeds) {
     }
 }
 
-void print_table(uint8_t* table) { //TODO - fix for new structure
-    int idx=1;
-    for (int pool_idx=0; pool_idx<table[0]; pool_idx++) {
-        printf("[%d, %d]\n", table[idx+0], table[idx+1]);
-        idx += 2;
-        int num_ent = table[idx++];
-        for (int ent_idx=0; ent_idx<num_ent; ent_idx++) {
-            printf("    Item #%d (w=%d) - [%d, %d] ench=%d\n", table[idx+0], table[idx+1], table[idx+2], table[idx+3], table[idx+4]);
-            idx += 5;
-        }
-    }
-    printf("\n");
-}
-
 void gpu_init() {
     printf("Copying data to GPU...\n");
     cudaMemcpyToSymbol(d_table, h_table, MAX_LOOT_TABLE_SIZE*sizeof(uint8_t));
@@ -249,26 +229,9 @@ void gpu_init() {
     cudaMemset(&d_correct_count, 0, sizeof(uint32_t));
 
     printf("Launching kernel...\n");
-    const uint64_t NUM_SEEDS_TO_CHECK = 1L << 42;
-    #define CASE(n) case n: check_loot_collision<n><<<1024, BLOCKSIZE>>>(0, NUM_SEEDS_TO_CHECK); break;
-    switch (h_distinct_items) {
-        CASE(2);
-        CASE(3);
-        CASE(4);
-        CASE(5);
-        CASE(6);
-        CASE(7);
-        CASE(8);
-        CASE(9);
-        CASE(10);
-        CASE(11);
-        CASE(12);
-        CASE(13);
-        CASE(14);// TODO - parameterize discretely
-        CASE(15);
-        CASE(16);
-        default: printf("ERROR - input has more distinct items than this binary supports. Please recompile.\n"); exit(1);
-    }
+    const uint64_t NUM_SEEDS_TO_CHECK = 1L << 42; // todo - base on filter #1
+    check_loot_collision<<<1024, 256>>>();
+
 
     cudaDeviceSynchronize();
 
@@ -284,10 +247,10 @@ uint32_t shuffle_order = 0b011100111011101100001001101;
 uint8_t table[1140] = {2, 0, 0, 0, 2, 4, 232, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 1, 1, 5, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 2, 2, 7, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 1, 4, 6, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 3, 1, 3, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 4, 3, 7, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 5, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 4, 4, 50, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 1, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 4, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 6, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0, 7, 1, 8, 0};
 uint8_t target[8] = {0, 0, 4, 3, 5, 1, 1, 6};
 int distinct_items = 8;
-int64_t spawns_checks[12] = {7353, 10953, BURIED_TREASURE, 0, 7984, 10480, DESERT_TEMPLE, 0, 7450, 10968, DESERT_TEMPLE};
-int num_spawn_checks = 3;
+int64_t spawns_checks[12] = {7984, 10480, DESERT_TEMPLE, 0, 7450, 10968, DESERT_TEMPLE};
+int num_spawn_checks = 1;
 int32_t feature_seed_info[4] = {7984, 10480, 3, 4}; // x, z, index, step
-uint64_t buried_treasure_float = 1153169326606791148LL;
+uint64_t buried_treasure_float = 1153169326606791148LL; // 75998109126254LL
     int popcnt = 0;
     for (int i=0; i<27; i++) popcnt += ((shuffle_order >> i)&1);
     if (distinct_items > MAX_DISTINCT_ITEMS) {

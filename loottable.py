@@ -89,7 +89,7 @@ def load_table(table):
                 assert all(key in ['type', 'weight'] for key in entry), f"Bad key for entry {entry}"
                 weight = entry.get('weight', 1)
                 assert type(weight) is int
-                out[-1][-1].append([None,weight])
+                out[-1][-1].append([[None,(1,1),[]],weight])
             else:
                 raise ValueError(f"Unknown type {entry_type} for entry {entry}")
     return out
