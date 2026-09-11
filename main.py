@@ -69,15 +69,15 @@ def get_info(ss_dir, ss_count=10):
             ],col_widths)
     print_table_row(None,col_widths)
 
-    print_table_row([f"Detected {len(candidates)} screenshots with loot inventories:"], [sum(col_widths)+3*len(col_widths)-3])
+    print_table_row([f"Detected {len(candidates)} screenshots with loot inventories in {time.time()-t0:.2f}s"], [sum(col_widths)+3*len(col_widths)-3])
     print_table_row(None,col_widths)
-    print(f"{time.time() - t0:.2f}s")
     print('\nEnter a comma-separated list of structures to use for filtering step.\n' \
         'The first structure will be used for the loot-based cracking.\n'
         'This step is much faster than the full loot-based cracker.\n' \
         'I recommend at least 16 bits of [F] entropy.\n' \
         'The structure with the largest [R] entropy will be used for fast iteration over reversal of initial PRNG calls.' \
-        'You should have at least 48 bits of entropy [I]+[S] of the first entry + [R] of the entry with maximum [R] + the sum of [F] for all entries other than max [R].')
+#        'You should have at least 48 bits of entropy [I]+[S] of the first entry + [R] of the entry with maximum [R] + the sum of [F] for all entries other than max [R].'
+        )
     spawn_checks = []
     while len(spawn_checks) == 0:
         while True:
@@ -161,8 +161,8 @@ def process_info_for_cuda(spawn_checks_in, loot_container, loot_spawn):
     ench_callcounts = get_enchant_rng_call_data_c()
     print(f"\nCracking structure {table} loot chest with these contents:")
     print_container(loot_container)
-    for x,z,table in spawn_checks_in:
-        print(f"Filtering seeds using structure spawn of type {table} as coordinates {x},{z}")
+    for x_,z_,table_ in spawn_checks_in:
+        print(f"Filtering seeds using structure spawn of type {table_} as coordinates {x_},{z_}")
     print()
 
     return (shuffle_order,

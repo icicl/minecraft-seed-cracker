@@ -213,8 +213,8 @@ def process_image(path, prompt_uncertain=True, verbose=False):
     atlas_arr = np.array(atlas)
     textures = atlas_arr[:,:,:3].reshape(16,tilesize,16,tilesize,3).swapaxes(1,2).reshape(256,tilesize,tilesize,3)
     texture_opacity_masks = (atlas_arr[:,:,-1] == 255).reshape(16,tilesize,16,tilesize).swapaxes(1,2).reshape(256,tilesize,tilesize)
-    textures = textures.reshape(256,-1,3)
-    texture_opacity_masks = texture_opacity_masks.reshape(256,-1)
+    textures = textures.reshape(256,-1,3)[:len(all_items)]
+    texture_opacity_masks = texture_opacity_masks.reshape(256,-1)[:len(all_items)]
     chars = get_chars(scale)
 
 

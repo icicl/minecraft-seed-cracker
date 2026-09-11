@@ -261,7 +261,7 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
                                 match &= (split[i] == d_split_stacks[ind[26-i]]);
                             }
                             if (match) {
-                                printf("\rFound match for 48-bit loot table seed: \e[1;35m%ld\e[0m                                              \n", wseed);
+                                printf("Found match for 48-bit loot table seed: \e[1;35m%ld\e[0m                                              \n", wseed);
                                 if ((wseed >> 32) == 0) printf("  -> Possible world seed, if seed was entered as a string (hashed to int32): \e[1;33m%ld\e[0m\n", wseed);
                                 uint64_t s2_47_16 = wseed & 0xFFFFFFFF;
                                 int32_t s1_31_16 = wseed >> 32;
@@ -343,14 +343,18 @@ void dispatch(
 
     printf("Launching full kernel...\n");
     timer = -time_us();
-    uint16_t num_dispatches = 256;
+    uint16_t num_dispatches = 1024;
+//    const uint8_t braile[8] = {0b01000111, 0b11000110, 0b11100100, 0b11110000, 0b10111000, 0b00111001, 0b00011011, 0b00001111};
+    const char* braile[] = {"⡇", "⣆", "⣤", "⣰", "⢸", "⠹", "⠛", "⠏"};
     for (uint16_t dispatch_idx=0; dispatch_idx<num_dispatches; dispatch_idx++) {
         check_loot_collision<<<1024, 256>>>(num_dispatches, dispatch_idx);
         cudaDeviceSynchronize();
-        printf("\r%4.1f%% of seeds processed. %4.1fs elapsed.", 100.0*(dispatch_idx+1)/num_dispatches, 0.000001*(time_us()+timer));
+        printf("%s%4.1f%% of seeds processed. %.1fs elapsed. ETA: %.1fs       \r", braile[dispatch_idx%8], 100.0*(dispatch_idx+1)/num_dispatches, 0.000001*(time_us()+timer), (0.000001*(time_us()+timer))*(num_dispatches - dispatch_idx - 1)/(dispatch_idx + 1));
         fflush(stdout);
     }
     uint64_t h_match_counts[5];
     cudaMemcpyFromSymbol(&h_match_counts, d_match_counts, 5*sizeof(unsigned long long*));
-    printf("\n\nChecked \e[1;37m%lu\e[0m seeds. \n\e[1;37m%lu\e[0m passed structure spawn check.\nFiltered to \e[1;37m%lu\e[0m matches using item quantities in loot.\nFurther filtered to \e[1;37m%lu\e[0m matches using the shuffle of empty slots.\nReduced to \e[1;37m%lu\e[0m final seeds using the exact split+shuffle of items.\n", h_match_counts[0], h_match_counts[1], h_match_counts[2], h_match_counts[3], h_match_counts[4]);
+    printf("                                                           \n");
+    printf("Execution finished in \e[1;34m%4.1fs\e[0m.\n", 0.000001*(time_us()+timer));
+    printf("Checked \e[1;37m%lu\e[0m seeds. \n\e[1;37m%lu\e[0m passed structure spawn check.\nFiltered to \e[1;37m%lu\e[0m matches using item quantities in loot.\nFurther filtered to \e[1;37m%lu\e[0m matches using the shuffle of empty slots.\nReduced to \e[1;37m%lu\e[0m final seeds using the exact split+shuffle of items.\n", h_match_counts[0], h_match_counts[1], h_match_counts[2], h_match_counts[3], h_match_counts[4]);
 }
