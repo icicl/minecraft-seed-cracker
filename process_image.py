@@ -1,6 +1,7 @@
 import os, zipfile, re, string, xxhash, time
 from PIL import Image
 import numpy as np
+from functools import cache
 
 from extract import load_all_tables, load_atlas, load_ascii
 
@@ -10,7 +11,19 @@ def arrhash(arr):
     return xxhash.xxh3_64(arr.data).intdigest()
 
 
-def get_chars():
+@cache
+def get_chars(scale):
+    ascii_np = np.array(load_ascii().resize((8*16*scale, 8*16*scale), Image.Resampling.NEAREST))
+    chars = {}
+    for i in range(32, 128):
+        y = i // 16
+        x = i % 16
+        chars[chr(i)] = np.where(ascii_np[8*y*scale:8*(y+1)*scale,8*scale*x:8*(x+1)*scale][:,:,-1] != 0, 1, 0)
+    for c,carr in chars.items():
+        chars[c] = carr[:np.argmax((carr.sum(axis=1) != 0) * np.arange(8*scale))+1,:np.argmax((carr.sum(axis=0) != 0) * np.arange(8*scale))+1]
+    return chars
+
+def get_chars_packed():
     ascii_im = load_ascii().convert("RGBA")
     ascii_arr = np.array(ascii_im)
     chars = {}
@@ -26,6 +39,7 @@ def get_chars():
             if n & mask == n: break
         chars[chr(charpoint)] = (n,width,mask)
     return chars
+#chars_packed = get_chars_packed()
 
 
 def ocr(im, stride=None, xslice=slice(None), yslice=slice(None)):
@@ -52,7 +66,7 @@ def ocr(im, stride=None, xslice=slice(None), yslice=slice(None)):
 
         hits = {}
         masked_cache = {} # avoid recomputing masked array every time
-        for c,(n,w,m) in chars.items():
+        for c,(n,w,m) in chars_packed.items():
             m = m | (m << 1) # whitespace on right
             if w < 8: m,n = m | (m << 1), n << 1 # whitespace on left
             if m not in masked_cache: masked_cache[m] = (psum_64 & m)
@@ -73,12 +87,10 @@ def ocr(im, stride=None, xslice=slice(None), yslice=slice(None)):
                     s += ' '
                     targ_x = x
                 s += c
-                targ_x += chars[c][1] + 1
+                targ_x += chars_packed[c][1] + 1
             if set(string.ascii_letters + string.digits) & set(s): text += s.strip() + '\n' # ignore unaccompanied ,.|;: type hits 
         texts.append(text)
     return max(texts,key=len)
-
-chars = get_chars()
 
 
 def get_coords(im, scale=None):
@@ -133,7 +145,6 @@ def process_image(path, prompt_uncertain=True, verbose=False):
         best = None
         best_silh = (0,None)
         diffs = textures - slot_arr
-        diffs = diffs.reshape(256,-1,3)
         diff_sqs = (diffs)**2
         near_matches = ((diff_sqs.sum(axis=-1) <= 3) & texture_opacity_masks)
         near_matches = near_matches.sum(axis=(1))
@@ -171,25 +182,23 @@ def process_image(path, prompt_uncertain=True, verbose=False):
     if im.mode == "RGB":
         black = (0,0,0)
     elif im.mode == "RGBA":
-        black = (0,0,0,255)
+        black = (0,0,0)
     else:
         im = im.convert('RGB')
         black = (0,0,0)
-    il = im.load()
+#    il = im.load()
     im_arr = np.array(im)
     if im_arr.shape[2] == 4: im_arr = im_arr[:,:,:3] # RBGA -> RGB
 
     w,h = im.size
-    scale = sum(il[x,h//2] == black for x in range(w//2))
+    scale = (im_arr[h//2].sum(axis=-1) == 0).sum()//2
     if not 1 <= scale <= 8:
         if verbose: print(f"Container GUI not detected in {path}.")
         return None
     if verbose: print(f"Detected GUI scale = {scale}.")
 
-    for x1 in range(w): # Container GUI boundaries
-        if il[x1, h//2] == black: break
-    for y1 in range(h):
-        if il[w//2, y1] == black: break
+    x1 = np.argmin(im_arr[h//2].sum(axis=-1))
+    y1 = np.argmin(im_arr[:,w//2].sum(axis=-1))
 
     all_tables = load_all_tables()
     all_items = set()
@@ -208,16 +217,9 @@ def process_image(path, prompt_uncertain=True, verbose=False):
     texture_opacity_masks = (atlas_arr[:,:,-1] == 255).reshape(16,tilesize,16,tilesize).swapaxes(1,2).reshape(256,tilesize,tilesize)
     textures = textures.reshape(256,-1,3)
     texture_opacity_masks = texture_opacity_masks.reshape(256,-1)
+    chars = get_chars(scale)
 
 
-    ascii_np = np.array(load_ascii().resize((8*16*scale, 8*16*scale), Image.Resampling.NEAREST))
-    chars = {}
-    for i in range(32, 128):
-        y = i // 16
-        x = i % 16
-        chars[chr(i)] = np.where(ascii_np[8*y*scale:8*(y+1)*scale,8*scale*x:8*(x+1)*scale][:,:,-1] != 0, 1, 0)
-    for c,carr in chars.items():
-        chars[c] = carr[:np.argmax((carr.sum(axis=1) != 0) * np.arange(8*scale))+1,:np.argmax((carr.sum(axis=0) != 0) * np.arange(8*scale))+1]
 
 
 #    coords = get_coords(im, scale)
