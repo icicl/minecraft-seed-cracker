@@ -124,10 +124,14 @@ def process_image(path, prompt_uncertain=True, verbose=False):
             if item is None:
                 if prompt_uncertain and conf != 1:
                     while True:
-                        inp = input(f"Failed to detect item in row {cy}, column {cx}. Enter the item and quantity (ex. 'leather_chestplate,1'): ").replace(' ','')
+                        inp = input(f"Failed to detect item in row {cy}, column {cx}. Enter the item and quantity (ex. 'leather_chestplate,1'). Enter [S] to show the offending slot, or [F] to show the whole image.: ").replace(' ','')
                         if inp.count(',') == 1:
                             item,qty = inp.split(',')
                             if qty.isdecimal() and (item in all_items or 'minecraft:'+item in all_items): break
+                        if inp.lower() == 's':
+                            slot.show()
+                        if inp.lower() == 'f':
+                            im.show()
                     if item not in all_items: item = 'minecraft:' + item
                     contents.append((item,int(qty)))
                 else:

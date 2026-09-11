@@ -1,3 +1,6 @@
 crack
 __pycache__
 *.ipynb
+ss
+*.so
+cache

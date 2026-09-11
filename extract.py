@@ -7,6 +7,13 @@ from loottable import load_table
 os.makedirs('cache/', exist_ok=True)
 
 zf = '/home/icicl/.minecraft/versions/1.16.1/1.16.1.jar'
+zf = './cache/1.16.1.jar'
+if not os.path.exists(zf):
+    import requests
+    url = 'https://piston-data.mojang.com/v1/objects/c9abbe8ee4fa490751ca70635340b7cf00db83ff/client.jar'
+    print(f"Downloading Minecraft .jar...")
+    data = requests.get(url).content
+    with open(zf, 'wb') as f: f.write(data)
 
 table_cache = {}
 def get_chest_loot_table(chest, save=False):
