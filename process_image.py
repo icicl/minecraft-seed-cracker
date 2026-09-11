@@ -116,25 +116,31 @@ def process_image(path, prompt_uncertain=True, verbose=False):
 
     def get_match(slot):
         slot_arr = np.array(slot)
+        slot_mask = np.where(abs(slot_arr - slot_arr[0,0]).sum(axis=-1) != 0, True, False)
         is_empty = abs(slot_arr - slot_arr[0,0]).sum() == 0
         if is_empty:
             return 1,None,0
         idx = 0
         best_score = 0.25
         best = None
+        best_silh = (0,None)
         for x in range(0,16*16*scale, 16*scale):
             for y in range(0, 16*16*scale, 16*scale):
                 if idx < len(all_items):
                     tex = atlas_arr[x:x+16*scale,y:y+16*scale]
-                    mask = np.where(tex[:,:,-1] == 255, 1, 0)
+                    mask = np.where(tex[:,:,-1] == 255, True, False)
                     diff_sq = (mask[:,:,None] * (tex - slot_arr))**2
                     near_matches = ((diff_sq.sum(axis=-1) <= 3) * mask).sum() # each pixel can miss by up to 1
                     score = near_matches / mask.sum()
+                    mask_similarity = (slot_mask*mask).sum() / (mask | slot_mask).sum()
                     if score > best_score:
                         best_score, best = score, all_items[idx]
+                    best_silh = min(best_silh, (-mask_similarity, all_items[idx]))
                 idx += 1
         qty = ocr_qty(slot_arr, 16*scale, 16*scale-7*scale, '0123456789', 252)
         qty = int(qty) if qty else 1
+        if best is None and best_silh[0] == -1:
+            return -1, best_silh[1], qty
         return round(best_score,3), best, qty
 
 
@@ -201,6 +207,8 @@ def process_image(path, prompt_uncertain=True, verbose=False):
             py = y1 + (1 + 2 +14 + 1)*scale + (1 + 16 + 1)*scale*cy
             slot = im.crop((px, py, px+16*scale, py+16*scale))
             conf,item,qty = get_match(slot)
+            if conf == -1:
+                print(f"Detected enchanted item {item} in row {cy+1}, column {cx+1}. Please ensure this is correct, as the enchantment glint can interfere with detection.")
             if item is None:
                 if prompt_uncertain and conf != 1:
                     while True:

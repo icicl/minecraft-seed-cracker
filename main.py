@@ -69,6 +69,9 @@ def get_info(ss_dir, ss_count=10):
         candidate_used_for_loot_cracking = None
         for idx in ids:
             file,coords,possible_tables,loot,contents = candidates[idx-1]
+            if len(possible_tables) != 1:
+                print(f"Skipping ID# {idx} - Ambiguous structure type.")
+                continue
             table = possible_tables[0]
             if table not in salts:
                 print(f"Skipping ID# {idx} - Currently only sturctures supported are: {', '.join(list(salts))}")
@@ -78,9 +81,6 @@ def get_info(ss_dir, ss_count=10):
                 print(f"Skipping ID# {idx} - Must have coordinates to use in filtering.")
                 continue
             x,z = coords[0],coords[2]
-            if len(possible_tables) != 1:
-                print(f"Skipping ID# {idx} - Ambiguous structure type.")
-                continue
             if (x//16,z//16) in seen_cc:
                 print(f"Skipping ID# {idx} - Belongs to a structure already used for filtering.")
                 continue
@@ -88,7 +88,11 @@ def get_info(ss_dir, ss_count=10):
             if h4 > best_h4:
                 best_h4 = h4
                 _,_,feat_seed_salt,grid_spacing,enum_idx,_ = salts[table]
-                feat_seed_base = (((x // grid_spacing)*341873128712+(z // grid_spacing)*132897987541 + feat_seed_salt) & 0xFFFF_FFFF_FFFF) | (enum_idx << 48)
+                feat_seed_base = (((x // grid_spacing)*341873128712+(z // grid_spacing)*132897987541 + feat_seed_salt) & 0xFFFF_FFFF_FFFF) | (enum_idx << 56)
+                spawn_check_type = salts[table][5][0]
+                if spawn_check_type == 0:
+                    spacing = salts[table][5][1]
+                    feat_seed_base |= ((x // 16) % spacing) << 48
                 skip_prng_reverse_feature = len(spawn_checks) if abs(h4 - h3) < 0.0001 else None
             spawn_check_type = salts[table][5][0]
             cx,cz = x//16,z//16
@@ -140,7 +144,7 @@ def run(ss_dir, ss_count):
         table = possible_tables[0]
 
     h1, h2, _, _ = entropy(table, loot, contents)
-    step,index,feat_seed_salt,grid_spacing,enum_idx,_ = salts[table]
+    step,index,feat_seed_salt,_,enum_idx,_ = salts[table]
     shuffle_order = 0
     for i in range(27): shuffle_order |= ((contents[i][0] is not None) << i)
     loottable,lookup = loottable_c(table, loot)

@@ -147,10 +147,10 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
     int64_t inner_lb, inner_ub, inner_stride;
     int64_t outer_lb, outer_ub, outer_stride;
 
-    switch (prng_first_call_salt >> 48) {
+    switch (prng_first_call_salt >> 56) {
         case DESERT_TEMPLE:
             inner_lb = dispatch_idx, inner_ub = (1LL<<17), inner_stride = num_dispatches;
-            outer_lb = (17LL + 24*tx)<<17, outer_ub = (1LL << 48), outer_stride = (24LL*stride)<<17;
+            outer_lb = (((prng_first_call_salt >> 48) & 0xFF) + 24*tx)<<17, outer_ub = (1LL << 48), outer_stride = (24LL*stride)<<17;
             break;
         case BURIED_TREASURE:
             inner_lb = tx + dispatch_idx*stride, inner_ub = FLOAT_0_01_LIM, inner_stride = num_dispatches*stride;
@@ -158,7 +158,7 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
             break;
         case RUINED_PORTAL:
             inner_lb = dispatch_idx, inner_ub = (1LL<<17), inner_stride = num_dispatches;
-            outer_lb = (17LL + 25*tx)<<17, outer_ub = (1LL << 48), outer_stride = (25LL*stride)<<17;
+            outer_lb = (((prng_first_call_salt >> 48) & 0xFF) + 25*tx)<<17, outer_ub = (1LL << 48), outer_stride = (25LL*stride)<<17;
             break;
     }
 
