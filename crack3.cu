@@ -71,7 +71,7 @@ __device__ int64_t next_long(int64_t& seed) {
 }
 
 __device__ int64_t reverse_prng_call(int64_t rng_out, int64_t packed_info) {
-    int64_t prev = (rng_out * 0xdfe05bcb1365 + 0x615c0e462aa9);
+    int64_t prev = (rng_out * 0xdfe05bcb1365L + 0x615c0e462aa9L);
     prev ^= LCG_MUL;
     prev -= packed_info;
     return prev & LCG_MSK;
@@ -170,7 +170,7 @@ __global__ void check_loot_collision(uint32_t num_dispatches, uint32_t dispatch_
             }
             if (!spawn_ok) continue;
             spawn_ok_count++;
-            
+
             for (int calls=0; calls<4; calls++) { // DES TEMPLE TODO parameterize (use x/z to get call#)
                 int match = 1;
                 for (uint8_t save_to_smem=0; save_to_smem<2; save_to_smem++) { // it is faster to re-run the loot calculation for the rare case when we get a hit, rather than saving the stack sizes to shared mem every time
@@ -336,7 +336,7 @@ void dispatch(
         check_loot_collision<<<1024, 256>>>(test_kernel_size, 0);
         cudaDeviceSynchronize();
         timer += time_us();
-    } while (timer < 200000);
+    } while (timer < 200000 && test_kernel_size > 256);
 
     printf("Test kernel finished in %.1fms\n",(float)timer / 1000);
     printf("Estimated time to check all seeds: \e[1;34m%.1fs\e[0m\n\n", (float)timer / 1000000 * test_kernel_size);
@@ -349,7 +349,7 @@ void dispatch(
     for (uint16_t dispatch_idx=0; dispatch_idx<num_dispatches; dispatch_idx++) {
         check_loot_collision<<<1024, 256>>>(num_dispatches, dispatch_idx);
         cudaDeviceSynchronize();
-        printf("%s%4.1f%% of seeds processed. %.1fs elapsed. ETA: %.1fs       \r", braile[dispatch_idx%8], 100.0*(dispatch_idx+1)/num_dispatches, 0.000001*(time_us()+timer), (0.000001*(time_us()+timer))*(num_dispatches - dispatch_idx - 1)/(dispatch_idx + 1));
+        printf(" %s%4.1f%% of seeds processed. %.1fs elapsed. ETA: %.1fs       \r", braile[dispatch_idx%8], 100.0*(dispatch_idx+1)/num_dispatches, 0.000001*(time_us()+timer), (0.000001*(time_us()+timer))*(num_dispatches - dispatch_idx - 1)/(dispatch_idx + 1));
         fflush(stdout);
     }
     uint64_t h_match_counts[5];

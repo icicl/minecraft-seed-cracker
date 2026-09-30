@@ -1,12 +1,20 @@
 # GPU-Accelerated Minecraft Seed Cracker
 
-An end-to-end GPU-accelerated utility for Minecraft reverse seed-cracking. This project reads targeted block coordinates and loot inventory contents directly from game screenshots via OCR and computer vision, matches container loot structures against PRNG generation algorithms, and executes a CUDA-accelerated parallel search across the $2^{48}$ LCG seed space to recover the exact world seed.
+A GPU-accelerated utility for Minecraft seed-cracking. This project brute forces the Java Random PRNG LCG to find the seed that produces a given structure chest in the following process:
+1. Structure generates at current coordinates.
+2. The total number of each loot item in the chest matches.
+3. The exact slot locations and stack sizes in the chest match. 
 
----
+It uses python to extract the necessary information automatically from a screenshot.
+
 ## Requirements
 NVidia GPU with `nvcc` and `python3` installed.
 ## How to use
   1. Compile to a shared object, allowing python to directly call the CUDA methods. This only needs to be done once.
+  Either use the included Makefile, or manually compile (run either of the following).
+```
+make
+```
 ```
 nvcc -O3 -Xcompiler -fPIC -shared crack3.cu -o crack.so
 ```
@@ -39,3 +47,15 @@ python3 main.py /path/to/screenshots/  # manually specify
   3. **Empty Slot Shuffle**: Use the initial shuffle of items to rule out seeds where an empty slot in the screenshot would be occupied.
   4. **Exact item Shuffle**: Verify the exact slots and stack sizes of all items after all shuffling and splitting.
   5. **Initial LCG PRNG Reversal**: the structures and loot are determined by only the lower 48 bits of a 64 bit seed. If a seed was not manually specified, the world seed is produced by a call to Java.Random.nextLong(), so it is easy to check all 2^16 possible full seeds for being a possible output of this call.
+
+## Usage Demo Screenshots
+<details>
+<summary><b>Seedcracker while running:</b> shows found seeds, progress, time elapsed, and ETA</summary>
+
+![Running](images/running.png)
+</details>
+<details>
+<summary><b>Seedcracker once completed:</b> shows found seeds, time taken, and info on number of seeds checked</summary>
+
+![Running](images/complete.png)
+</details>
